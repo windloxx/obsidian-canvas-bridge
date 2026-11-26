@@ -10,7 +10,7 @@ import unittest
 import uuid
 from pathlib import Path
 from textwrap import dedent
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import bridge_client
 
@@ -214,6 +214,63 @@ class BridgeClientTests(unittest.TestCase):
         job = self.bridge._read_json_safe(file)
         self.assertEqual((job["status"], job["reply"], job["observed_model"], job["replyTime"], job["error"]),
                          ("replied", "完成", MODEL, execution["completed_at"], ""))
+
+    def test_worker_dispatches_to_isolated_binding_when_workspace_bindings_are_ambiguous(self):
+        file = self.make_job()
+        self.bridge.tool_bind_session.side_effect = [
+            {"ok": False, "error_code": "AMBIGUOUS_WORKSPACE_BINDINGS", "binding_ids": ["b1", "b2"]},
+            {"ok": True, "binding_id": "isolated"},
+        ]
+        self.bridge.tool_unbind_session = Mock()
+        bridge_client.write_job(self.bridge._execution_path("dispatch"), {"status": "completed"})
+
+        with patch.object(bridge_client, "load_bridge", return_value=self.bridge):
+            bridge_client.codex_worker(self.server, file)
+
+        bind_args = dict(
+            workspace_path=str(self.workspace.resolve()), transport="codex_exec", mode="autopilot",
+            codex_model=MODEL, codex_effort="high", codex_speed="fast",
+        )
+        self.assertEqual(self.bridge.tool_bind_session.call_args_list, [
+            call(**bind_args, reuse_workspace_binding=True),
+            call(**bind_args, reuse_workspace_binding=False),
+        ])
+        self.bridge.tool_dispatch_task.assert_called_once()
+        self.assertEqual(self.bridge.tool_dispatch_task.call_args.kwargs["binding_id"], "isolated")
+        self.bridge.tool_unbind_session.assert_called_once_with("isolated")
+        self.assertEqual(self.bridge._read_json_safe(file)["status"], "replied")
+
+    def test_model_switch_sets_ephemeral_when_bind_explicitly_supports_it(self):
+        options = []
+
+        def bind_session(*, reuse_workspace_binding, ephemeral=False, **kwargs):
+            options.append((reuse_workspace_binding, ephemeral))
+            if reuse_workspace_binding:
+                return {"ok": True, "binding_id": "old", "reused": True, "lock": {"model_profile": {"model": MODEL}}}
+            return {"ok": True, "binding_id": "isolated", "lock": {"model_profile": {"model": kwargs["codex_model"]}}}
+
+        self.bridge.tool_bind_session = bind_session
+        job = {"target_workspace": str(self.workspace), "model_selected": True}
+
+        binding = bridge_client.acquire_codex_binding(self.bridge, job, "provider/codex/model-b", "high", "fast")
+
+        self.assertEqual(binding, ("isolated", True))
+        self.assertEqual(options, [(True, False), (False, True)])
+
+    def test_worker_releases_isolated_binding_before_rejecting_mismatched_model(self):
+        file = self.make_job()
+        job = self.bridge._read_json_safe(file)
+        self.bridge.tool_bind_session.side_effect = [
+            {"ok": False, "error_code": "AMBIGUOUS_WORKSPACE_BINDINGS", "binding_ids": ["b1", "b2"]},
+            {"ok": True, "binding_id": "isolated", "lock": {"model_profile": {"model": "provider/codex/model-b"}}},
+        ]
+        self.bridge.tool_unbind_session = Mock()
+
+        with self.assertRaisesRegex(ValueError, "拒绝派发：新建会话的模型与已选模型不一致。"):
+            bridge_client.execute_codex_job(self.bridge, file, job)
+
+        self.bridge.tool_unbind_session.assert_called_once_with("isolated")
+        self.bridge.tool_dispatch_task.assert_not_called()
 
     def test_worker_rechecks_model_prefix_and_refuses_incompatible_reused_binding(self):
         file = self.make_job()

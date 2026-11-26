@@ -1,6 +1,7 @@
 """Vault-scoped reader and sender for the installed Windows desktop bridge."""
 
 from datetime import datetime, timezone
+import inspect
 import json
 import os
 from pathlib import Path
@@ -395,6 +396,64 @@ def finalize_job(job, execution):
                observed_model=execution.get("observed_model", ""), replyTime=execution.get("completed_at", ""), error=error)
 
 
+def _supports_ephemeral_bind(bind_fn):
+    try:
+        param = inspect.signature(bind_fn).parameters.get("ephemeral")
+    except (TypeError, ValueError):
+        return False
+    return param is not None and param.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY,
+    )
+
+
+def _unbind_quietly(bridge, binding_id):
+    if binding_id and callable(getattr(bridge, "tool_unbind_session", None)):
+        try:
+            bridge.tool_unbind_session(binding_id)
+        except Exception:
+            pass
+
+
+def _bind_ephemeral_session(bridge, workspace_path, model, effort, speed):
+    kwargs = dict(
+        workspace_path=workspace_path, transport="codex_exec", mode="autopilot",
+        codex_model=model, codex_effort=effort, codex_speed=speed,
+        reuse_workspace_binding=False,
+    )
+    if _supports_ephemeral_bind(bridge.tool_bind_session):
+        kwargs["ephemeral"] = True
+    binding = bridge.tool_bind_session(**kwargs)
+    binding_id = require_result(binding, "binding_id", "建立 Codex 会话失败。")
+    bound_profile = (binding.get("lock") or {}).get("model_profile")
+    if bound_profile is not None and bound_profile.get("model") != model:
+        _unbind_quietly(bridge, binding_id)
+        raise ValueError("拒绝派发：新建会话的模型与已选模型不一致。")
+    return binding_id
+
+
+def acquire_codex_binding(bridge, job, model, effort, speed) -> tuple[str, bool]:
+    workspace_path = job["target_workspace"]
+    binding = bridge.tool_bind_session(
+        workspace_path=workspace_path, transport="codex_exec", mode="autopilot",
+        codex_model=model, codex_effort=effort, codex_speed=speed,
+        reuse_workspace_binding=True,
+    )
+    if not binding.get("ok") and binding.get("error_code") == "AMBIGUOUS_WORKSPACE_BINDINGS":
+        return _bind_ephemeral_session(bridge, workspace_path, model, effort, speed), True
+
+    binding_id = require_result(binding, "binding_id", "建立 Codex 会话失败。")
+    bound_profile = (binding.get("lock") or {}).get("model_profile")
+    if bound_profile is not None or binding.get("reused"):
+        bound_model = (bound_profile or {}).get("model")
+        bound_effort = (bound_profile or {}).get("effort") or ""
+        mismatch = bound_model != model or (effort and bound_effort not in ("", effort))
+        if mismatch:
+            if not is_allowed_model(bound_model) and not job.get("model_selected"):
+                raise ValueError("拒绝派发：复用会话的模型未通过当前模型护栏校验。")
+            return _bind_ephemeral_session(bridge, workspace_path, model, effort, speed), True
+    return binding_id, False
+
+
 def execute_codex_job(bridge, file, job):
     profile = worker_profile(bridge)
     if not is_allowed_model(profile["model"]):
@@ -403,34 +462,9 @@ def execute_codex_job(bridge, file, job):
     effort = job.get("requested_effort") or profile["effort"]
     if not is_allowed_model(model):
         raise ValueError(model_guard_error())
-    binding = bridge.tool_bind_session(
-        workspace_path=job["target_workspace"], transport="codex_exec", mode="autopilot",
-        codex_model=model, codex_effort=effort, codex_speed=profile["speed"],
-        reuse_workspace_binding=True,
-    )
-    binding_id = require_result(binding, "binding_id", "建立 Codex 会话失败。")
-    bound_profile = (binding.get("lock") or {}).get("model_profile")
-    ephemeral_binding = False
-    if bound_profile is not None or binding.get("reused"):
-        bound_model = (bound_profile or {}).get("model")
-        bound_effort = (bound_profile or {}).get("effort") or ""
-        mismatch = bound_model != model or (effort and bound_effort not in ("", effort))
-        if mismatch:
-            if not is_allowed_model(bound_model) and not job.get("model_selected"):
-                raise ValueError("拒绝派发：复用会话的模型未通过当前模型护栏校验。")
-            binding = bridge.tool_bind_session(
-                workspace_path=job["target_workspace"], transport="codex_exec", mode="autopilot",
-                codex_model=model, codex_effort=effort, codex_speed=profile["speed"],
-                reuse_workspace_binding=False,
-            )
-            binding_id = require_result(binding, "binding_id", "建立 Codex 会话失败。")
-            bound_profile = (binding.get("lock") or {}).get("model_profile")
-            if bound_profile is not None and bound_profile.get("model") != model:
-                raise ValueError("拒绝派发：新建会话的模型与已选模型不一致。")
-            ephemeral_binding = True
-
-    job.update(binding_id=binding_id, requested_model=model, requested_effort=effort)
+    binding_id, ephemeral_binding = acquire_codex_binding(bridge, job, model, effort, profile["speed"])
     try:
+        job.update(binding_id=binding_id, requested_model=model, requested_effort=effort)
         dispatch = bridge.tool_dispatch_task(
             binding_id=binding_id, step_goal=job["step_goal"], task_instruction=job["prompt"],
             constraints="遵循指令中的 Canvas 回写契约，由用户在 Obsidian 中应用补丁。" if job["canvas_path"] else "",
@@ -448,11 +482,8 @@ def execute_codex_job(bridge, file, job):
         write_job(file, job)
         finalize_job(job, execution_result(bridge, dispatch_id))
     finally:
-        if ephemeral_binding and callable(getattr(bridge, "tool_unbind_session", None)):
-            try:
-                bridge.tool_unbind_session(binding_id)
-            except Exception:
-                pass
+        if ephemeral_binding:
+            _unbind_quietly(bridge, binding_id)
 
 
 def codex_worker(server, file):
