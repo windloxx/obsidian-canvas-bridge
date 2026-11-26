@@ -58,7 +58,12 @@ class FakeBridge:
 
 class BridgeClientTests(unittest.TestCase):
     def setUp(self):
-        env_patch = patch.dict(os.environ, {bridge_client.REQUIRED_MODEL_PREFIX_ENV: ""})
+        env_patch = patch.dict(os.environ, {
+            bridge_client.REQUIRED_MODEL_PREFIX_ENV: "",
+            bridge_client.CODEX_IDLE_TIMEOUT_ENV: "",
+            bridge_client.CODEX_MAX_TIMEOUT_ENV: "",
+            bridge_client.CODEX_TIMEOUT_ENV: "",
+        })
         env_patch.start()
         self.addCleanup(env_patch.stop)
         temp = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
@@ -292,12 +297,134 @@ class BridgeClientTests(unittest.TestCase):
 
     def test_worker_records_timeout_as_blocked(self):
         file = self.make_job()
+        runner = Mock()
+        runner.read_latest_run.return_value = {"dispatch_id": "dispatch", "status": "running", "event_count": 1}
+        runner.is_dispatch_active.return_value = True
+        factory = Mock(side_effect=[runner, Mock()])
+        self.bridge._headless_runner = factory
+
+        def dispatch(**kwargs):
+            self.assertIs(self.bridge._headless_runner(), runner)
+            return {"ok": True, "dispatch_id": "dispatch"}
+
+        self.bridge.tool_dispatch_task.side_effect = dispatch
         with (patch.object(bridge_client, "load_bridge", return_value=self.bridge),
-              patch.object(bridge_client.time, "monotonic", side_effect=[0, 900])):
+              patch.object(bridge_client.time, "monotonic", side_effect=[0, 0, 1800]),
+              patch.object(bridge_client.time, "sleep") as sleep):
             bridge_client.codex_worker(self.server, file)
         job = self.bridge._read_json_safe(file)
         self.assertEqual(job["status"], "blocked")
-        self.assertIn("900 秒", job["error"])
+        self.assertIn("1800 秒", job["error"])
+        sleep.assert_called_once_with(0.5)
+        factory.assert_called_once_with()
+        runner.cancel_dispatch.assert_called_once_with("dispatch")
+
+    def test_worker_extends_idle_timeout_while_run_reports_activity(self):
+        file = self.make_job()
+        elapsed = 0
+        runner = Mock()
+        runner.is_dispatch_active.return_value = True
+        runner.read_latest_run.side_effect = [
+            {"dispatch_id": "dispatch", "status": "running", "event_count": count, "updated_at": str(count)}
+            for count in range(1, 6)
+        ]
+        self.bridge._headless_runner = Mock(return_value=runner)
+
+        def sleep(delay):
+            nonlocal elapsed
+            self.assertEqual(delay, 0.5)
+            elapsed += 5
+            if elapsed == 25:
+                bridge_client.write_job(self.bridge._execution_path("dispatch"), {"status": "completed"})
+
+        with (patch.dict(os.environ, {bridge_client.CODEX_IDLE_TIMEOUT_ENV: "10"}),
+              patch.object(bridge_client, "load_bridge", return_value=self.bridge),
+              patch.object(bridge_client.time, "monotonic", side_effect=[0, 0, 5, 10, 15, 20]),
+              patch.object(bridge_client.time, "sleep", side_effect=sleep)):
+            bridge_client.codex_worker(self.server, file)
+
+        job = self.bridge._read_json_safe(file)
+        self.assertEqual(job["status"], "replied")
+        self.assertEqual(elapsed, 25)
+        runner.cancel_dispatch.assert_not_called()
+
+    def test_worker_enforces_optional_max_timeout_and_cancels_dispatch(self):
+        file = self.make_job()
+        runner = Mock()
+        runner.is_dispatch_active.return_value = True
+        runner.read_latest_run.side_effect = [
+            {"dispatch_id": "dispatch", "status": "running", "event_count": count}
+            for count in range(1, 6)
+        ]
+        self.bridge._headless_runner = Mock(return_value=runner)
+
+        with (patch.dict(os.environ, {
+                  bridge_client.CODEX_IDLE_TIMEOUT_ENV: "10",
+                  bridge_client.CODEX_MAX_TIMEOUT_ENV: "20",
+              }),
+              patch.object(bridge_client, "load_bridge", return_value=self.bridge),
+              patch.object(bridge_client.time, "monotonic", side_effect=[0, 0, 5, 10, 15, 20]),
+              patch.object(bridge_client.time, "sleep")):
+            bridge_client.codex_worker(self.server, file)
+
+        job = self.bridge._read_json_safe(file)
+        self.assertEqual(job["status"], "blocked")
+        self.assertIn("20 秒", job["error"])
+        self.assertIn("最大时长上限", job["error"])
+        runner.cancel_dispatch.assert_called_once_with("dispatch")
+
+    def test_worker_recovers_terminal_result_from_matching_last_run_only(self):
+        file = self.make_job()
+        runner = Mock()
+        runner.is_dispatch_active.return_value = True
+        runner.read_latest_run.side_effect = [
+            {"dispatch_id": "other-dispatch", "status": "completed", "raw_reply": "过期"},
+            {"dispatch_id": "dispatch", "status": "completed", "raw_reply": "恢复"},
+        ]
+        self.bridge._headless_runner = Mock(return_value=runner)
+        with (patch.object(bridge_client, "load_bridge", return_value=self.bridge),
+              patch.object(bridge_client.time, "monotonic", side_effect=[0, 1]),
+              patch.object(bridge_client.time, "sleep")):
+            bridge_client.codex_worker(self.server, file)
+
+        job = self.bridge._read_json_safe(file)
+        self.assertEqual((job["status"], job["reply"]), ("replied", "恢复"))
+        self.assertEqual(runner.read_latest_run.call_args_list, [call("binding"), call("binding")])
+
+    def test_worker_fails_fast_when_dispatch_collector_exits_without_result(self):
+        file = self.make_job()
+        runner = Mock()
+        runner.is_dispatch_active.return_value = False
+        runner.read_latest_run.return_value = None
+        self.bridge._headless_runner = Mock(return_value=runner)
+        with (patch.dict(os.environ, {bridge_client.CODEX_IDLE_TIMEOUT_ENV: "100"}),
+              patch.object(bridge_client, "load_bridge", return_value=self.bridge),
+              patch.object(bridge_client.time, "monotonic", side_effect=[0, 0, bridge_client.CODEX_EXIT_GRACE]),
+              patch.object(bridge_client.time, "sleep") as sleep):
+            bridge_client.codex_worker(self.server, file)
+
+        job = self.bridge._read_json_safe(file)
+        self.assertEqual(job["status"], "blocked")
+        self.assertIn("提前退出", job["error"])
+        sleep.assert_called_once_with(0.5)
+        self.assertEqual(runner.read_latest_run.call_args_list, [call("binding")] * 3)
+        runner.cancel_dispatch.assert_not_called()
+
+    def test_timeout_env_override_controls_idle_timeout(self):
+        file = self.make_job()
+        with (patch.dict(os.environ, {
+                  bridge_client.CODEX_IDLE_TIMEOUT_ENV: " 7 ",
+                  bridge_client.CODEX_TIMEOUT_ENV: "9",
+              }),
+              patch.object(bridge_client, "load_bridge", return_value=self.bridge),
+              patch.object(bridge_client.time, "monotonic", side_effect=[0, 7]),
+              patch.object(bridge_client.time, "sleep") as sleep):
+            bridge_client.codex_worker(self.server, file)
+
+        job = self.bridge._read_json_safe(file)
+        self.assertEqual(job["status"], "blocked")
+        self.assertIn("7 秒", job["error"])
+        sleep.assert_not_called()
 
     def test_worker_preserves_the_reply_from_an_immediate_failed_execution(self):
         file = self.make_job()

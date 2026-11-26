@@ -1,8 +1,10 @@
 """Vault-scoped reader and sender for the installed Windows desktop bridge."""
 
 from datetime import datetime, timezone
+from functools import cache
 import inspect
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -16,10 +18,36 @@ import uuid
 SOURCE_PREFIX = "Obsidian sidebar / "
 RECENT_LIMIT = 30
 CODEX_JOBS = "obsidian_codex_jobs"
-CODEX_TIMEOUT = 900
+CODEX_IDLE_TIMEOUT_ENV = "OBSIDIAN_CANVAS_BRIDGE_CODEX_IDLE_TIMEOUT"
+CODEX_MAX_TIMEOUT_ENV = "OBSIDIAN_CANVAS_BRIDGE_CODEX_MAX_TIMEOUT"
+CODEX_TIMEOUT_ENV = "OBSIDIAN_CANVAS_BRIDGE_CODEX_TIMEOUT"
+CODEX_TIMEOUT = 1800
+CODEX_MAX_TIMEOUT = 0
+CODEX_EXIT_GRACE = 10.0
 REQUIRED_MODEL_PREFIX_ENV = "OBSIDIAN_CANVAS_BRIDGE_REQUIRED_MODEL_PREFIX"
 AGY_MODEL_ID = re.compile(r"[a-z0-9][a-z0-9._-]{1,95}")
 AGY_MODEL_TIER = re.compile(r"^([a-z0-9][a-z0-9._-]+)-(?:tiered-)?(?:low|medium|high|extra|max)$")
+
+
+def _parse_timeout(value):
+    try:
+        parsed = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed >= 0 else None
+
+
+def codex_idle_timeout():
+    for name in (CODEX_IDLE_TIMEOUT_ENV, CODEX_TIMEOUT_ENV):
+        value = _parse_timeout(os.environ.get(name))
+        if value is not None:
+            return value
+    return float(CODEX_TIMEOUT)
+
+
+def codex_max_timeout():
+    value = _parse_timeout(os.environ.get(CODEX_MAX_TIMEOUT_ENV))
+    return value if value is not None else float(CODEX_MAX_TIMEOUT)
 
 
 def paired_requests(bridge, route, workspace):
@@ -372,15 +400,99 @@ def dispatch_codex(bridge, server, workspace, payload):
     return {"ok": True, "job_id": job_id}
 
 
-def execution_result(bridge, dispatch_id):
+def _headless_runner(bridge):
+    try:
+        factory = getattr(bridge, "_headless_runner", None)
+        return factory() if callable(factory) else None
+    except Exception:
+        return None
+
+
+def _read_latest_run(bridge, binding_id, dispatch_id):
+    runner = _headless_runner(bridge)
+    if runner is None or not binding_id:
+        return None
+    try:
+        run = runner.read_latest_run(binding_id)
+    except Exception:
+        return None
+    if isinstance(run, dict) and run.get("dispatch_id") == dispatch_id:
+        return run
+    return None
+
+
+def _run_activity_signature(run):
+    fields = (
+        run.get("updated_at") or "",
+        run.get("last_event_at") or "",
+        run.get("event_count"),
+        run.get("turn_id") or "",
+        run.get("codex_session_id") or "",
+    )
+    return fields if any(fields) else None
+
+
+def _is_dispatch_active(bridge, dispatch_id):
+    try:
+        method = getattr(_headless_runner(bridge), "is_dispatch_active", None)
+        if not callable(method):
+            return None
+        active = method(dispatch_id)
+    except Exception:
+        return None
+    return active if isinstance(active, bool) else None
+
+
+def _cancel_dispatch_quietly(bridge, dispatch_id):
+    try:
+        method = getattr(_headless_runner(bridge), "cancel_dispatch", None)
+        if callable(method):
+            method(dispatch_id)
+    except Exception:
+        pass
+
+
+def execution_result(bridge, dispatch_id, binding_id=""):
     file = bridge._execution_path(dispatch_id)
-    deadline = time.monotonic() + CODEX_TIMEOUT
-    while time.monotonic() < deadline:
+    idle_timeout = codex_idle_timeout()
+    max_timeout = codex_max_timeout()
+    started = time.monotonic()
+    last_activity = started
+    last_signature = None
+    exited_at = None
+    while True:
         execution = bridge._read_json_safe(file) or {}
         if execution.get("status") in ("completed", "failed"):
             return execution
+        latest_run = _read_latest_run(bridge, binding_id, dispatch_id)
+        if latest_run and latest_run.get("status") in ("completed", "failed"):
+            return latest_run
+
+        now = time.monotonic()
+        if latest_run:
+            signature = _run_activity_signature(latest_run)
+            if signature is not None and signature != last_signature:
+                last_signature = signature
+                last_activity = now
+        active = _is_dispatch_active(bridge, dispatch_id)
+        if active is False:
+            if exited_at is None:
+                exited_at = now
+            elif now - exited_at >= CODEX_EXIT_GRACE:
+                execution = bridge._read_json_safe(file) or {}
+                if execution.get("status") in ("completed", "failed"):
+                    return execution
+                latest_run = _read_latest_run(bridge, binding_id, dispatch_id)
+                if latest_run and latest_run.get("status") in ("completed", "failed"):
+                    return latest_run
+                raise RuntimeError("Codex 后台执行进程已提前退出，未返回执行结果。")
+        if max_timeout > 0 and now - started >= max_timeout:
+            _cancel_dispatch_quietly(bridge, dispatch_id)
+            raise TimeoutError(f"等待 Codex 执行结果超过最大时长上限（{int(max_timeout)} 秒）。")
+        if idle_timeout > 0 and now - last_activity >= idle_timeout:
+            _cancel_dispatch_quietly(bridge, dispatch_id)
+            raise TimeoutError(f"等待 Codex 执行结果超时（连续 {int(idle_timeout)} 秒无进展）。")
         time.sleep(0.5)
-    raise TimeoutError(f"等待 Codex 执行结果超时（{CODEX_TIMEOUT} 秒）。")
 
 
 def require_result(result, field, fallback):
@@ -391,7 +503,9 @@ def require_result(result, field, fallback):
 
 def finalize_job(job, execution):
     completed = execution["status"] == "completed"
-    error = execution.get("error") or execution.get("error_code") or ("" if completed else "Codex 执行失败。")
+    error = execution.get("error") or (
+        "" if completed else execution.get("message") or execution.get("error_code") or "Codex 执行失败。"
+    )
     job.update(status="replied" if completed else "blocked", reply=execution.get("raw_reply", ""),
                observed_model=execution.get("observed_model", ""), replyTime=execution.get("completed_at", ""), error=error)
 
@@ -480,7 +594,7 @@ def execute_codex_job(bridge, file, job):
                 return
         require_result(dispatch, "dispatch_id", "Codex 派发失败。")
         write_job(file, job)
-        finalize_job(job, execution_result(bridge, dispatch_id))
+        finalize_job(job, execution_result(bridge, dispatch_id, binding_id=binding_id))
     finally:
         if ephemeral_binding:
             _unbind_quietly(bridge, binding_id)
@@ -489,7 +603,12 @@ def execute_codex_job(bridge, file, job):
 def codex_worker(server, file):
     job = json.loads(file.read_text(encoding="utf-8"))
     try:
-        execute_codex_job(load_bridge(server), file, job)
+        bridge = load_bridge(server)
+        runner_factory = getattr(bridge, "_headless_runner", None)
+        if callable(runner_factory):
+            # The runner tracks active and finished dispatches on the instance that launched them.
+            bridge._headless_runner = cache(runner_factory)
+        execute_codex_job(bridge, file, job)
     except Exception as error:
         job.update(status="blocked", error=str(error) or type(error).__name__, replyTime=now_iso())
     write_job(file, job)
