@@ -1,0 +1,9 @@
+{
+  "id": "obsidian-canvas-bridge",
+  "name": "Canvas Bridge",
+  "version": "1.1.0",
+  "minAppVersion": "1.13.0",
+  "description": "在侧栏通过 Antigravity 或无头 Codex 处理 Canvas 选区与开发任务，预览并应用画布补丁。",
+  "author": "windloxx",
+  "isDesktopOnly": true
+}
