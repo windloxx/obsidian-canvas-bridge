@@ -1,4 +1,6 @@
-const { Component, ItemView, MarkdownRenderer, Notice, Plugin, Scope, setIcon } = require("obsidian");
+const {
+  Component, ItemView, MarkdownRenderer, Notice, Plugin, PluginSettingTab, Scope, Setting, requestUrl, setIcon,
+} = require("obsidian");
 const { execFile } = require("node:child_process");
 const crypto = require("node:crypto");
 const { createHash, randomUUID } = crypto;
@@ -6,19 +8,19 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const CANVAS_BUILTINS = { "node:crypto": crypto, crypto, "node:path": path, path };
+const LOCAL_BUILTINS = { "node:crypto": crypto, crypto, "node:path": path, path };
 
-function loadCanvasContext(pluginDir) {
-  const filename = path.join(pluginDir, "canvas_context.js");
+function loadLocalModule(pluginDir, name, builtins) {
+  const filename = path.join(pluginDir, name);
   const source = fs.readFileSync(filename, "utf8");
   const mod = { exports: {} };
-  const localRequire = id => (Object.hasOwn(CANVAS_BUILTINS, id) ? CANVAS_BUILTINS[id] : require(id));
+  const localRequire = id => {
+    if (!Object.hasOwn(builtins, id)) throw new Error(`${name} cannot require ${id}`);
+    return builtins[id];
+  };
   new Function("module", "exports", "require", "__filename", "__dirname", source)(
     mod, mod.exports, localRequire, filename, pluginDir,
   );
-  if (typeof mod.exports?.extractSelectionSnapshot !== "function" || typeof mod.exports?.applyCanvasPatch !== "function") {
-    throw new Error("canvas_context.js 导出接口不完整。");
-  }
   return mod.exports;
 }
 
@@ -27,8 +29,11 @@ const DRAFT = `${VIEW}:draft`;
 const APPLIED = `${VIEW}:applied`;
 const AUTO_CAPTURE = `${VIEW}:auto-capture`;
 const MODEL_PREFS = `${VIEW}:models`;
+const PROVIDER_TASKS = `${VIEW}:provider-tasks`;
 const EXECUTORS = { agy: "AGY", codex: "Codex" };
 const MODES = { edit_canvas: "改选区画布", execute_task: "执行任务" };
+const BRIDGE_CAPABILITIES = { modes: Object.keys(MODES), supportsRepo: true };
+const PROVIDER_GUIDANCE = "请在设置 → Canvas Bridge 启用 OpenAI 兼容服务，或安装并启用 Codex-Antigravity-Bridge。";
 const STATUS = {
   queued: "等待领取", notified: "已通知", claimed: "已领取", running: "执行中", replied: "已回复",
   blocked: "受阻", notification_failed: "通知失败", cancelled: "已取消",
@@ -53,9 +58,14 @@ function iconButton(parent, icon, label) {
   return button;
 }
 
-function segmented(parent, label, options, onChange) {
-  const group = parent.createDiv({ cls: "bc-segment", attr: { role: "group", "aria-label": label } });
-  return Object.entries(options).map(([value, text]) => {
+function segmentGroup(parent, label) {
+  return parent.createDiv({ cls: "bc-segment", attr: { role: "group", "aria-label": label } });
+}
+
+function segmentButtons(group, options, onChange) {
+  group.empty();
+  group.hidden = !options.length;
+  return options.map(([value, text]) => {
     const button = group.createEl("button", { text, attr: { type: "button" } });
     button.onclick = () => onChange(value);
     return [value, button];
@@ -77,11 +87,7 @@ function loadModelPrefs(app) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return { agy: "", codex: "", codexEffort: "" };
   }
-  return {
-    agy: typeof raw.agy === "string" ? raw.agy : "",
-    codex: typeof raw.codex === "string" ? raw.codex : "",
-    codexEffort: typeof raw.codexEffort === "string" ? raw.codexEffort : "",
-  };
+  return Object.fromEntries(Object.entries(raw).filter(([, value]) => typeof value === "string"));
 }
 
 function fillSelect(select, options, selectedValue) {
@@ -125,9 +131,21 @@ function readCanvasView(view) {
 }
 
 function taskCanvas(task, metadata) {
-  if (task.executor === "codex") return task;
-  return task.source === "Obsidian" && typeof metadata?.canvasPath === "string" && metadata.executor === "agy"
-    ? metadata : {};
+  const executor = task.executor || "agy";
+  if (executor === "agy") {
+    return task.source === "Obsidian" && metadata?.executor === "agy" && typeof metadata.canvasPath === "string"
+      ? metadata : {};
+  }
+  if (executor === "codex") return task;
+  return {
+    canvasPath: typeof task.canvasPath === "string" && task.canvasPath ? task.canvasPath : metadata?.canvasPath,
+    selectedIds: Array.isArray(task.selectedIds) ? task.selectedIds : metadata?.selectedIds,
+    mode: task.mode || metadata?.mode,
+  };
+}
+
+function taskKey(task) {
+  return `${task.executor || "agy"}:${task.id}`;
 }
 
 function patchCounts({
@@ -186,6 +204,12 @@ function callBridge(registration, helper, workspace, payload) {
     child.stdin.on("error", reject);
     child.stdin.end(JSON.stringify({ ...payload, workspace }), "utf8");
   });
+}
+
+async function requestHttp({ url, method, headers, body }) {
+  if (typeof requestUrl === "function") return requestUrl({ url, method, headers, body, throw: false });
+  if (typeof globalThis.fetch === "function") return globalThis.fetch(url, { method, headers, body });
+  throw new Error("当前环境无法发送 HTTP 请求。");
 }
 
 async function renderMarkdown(view, markdown, container, sourcePath) {
@@ -343,9 +367,10 @@ function addTask(view, task, open) {
   const context = taskCanvas(task, parsed?.metadata);
   const canvasPath = context.canvasPath || (typeof parsed?.metadata.canvasPath === "string" ? parsed.metadata.canvasPath : "");
   const mode = context.mode || parsed?.metadata.mode;
-  const executor = EXECUTORS[task.executor] || "AGY";
+  const executor = task.providerLabel || view.plugin.providerLabel(task.executor) || "AGY";
   const details = view.list.createEl("details", { cls: "bc-task" });
   details.dataset.request = task.id;
+  details.dataset.taskKey = taskKey(task);
   details.dataset.status = task.status;
   details.open = open;
   const summary = details.createEl("summary");
@@ -368,7 +393,7 @@ function addTask(view, task, open) {
     const reply = body.createDiv({ cls: "bc-reply" });
     const heading = reply.createDiv({ cls: "bc-reply-heading" });
     setIcon(heading.createSpan(), "corner-down-right");
-    heading.createSpan({ text: task.executor === "codex" ? "Codex" : "Antigravity" });
+    heading.createSpan({ text: task.providerLabel || ((task.executor || "agy") === "agy" ? "Antigravity" : executor) });
     if (task.model) heading.createSpan({ cls: "bc-task-canvas", text: task.model });
     const at = heading.createEl("time", { text: formatTime(task.replyTime) });
     at.title = task.replyTime;
@@ -390,7 +415,6 @@ class BridgeView extends ItemView {
     this.plugin = plugin;
     this.active = false;
     this.sending = false;
-    this.loading = false;
     this.refreshAgain = false;
     this.signature = null;
     this.renderComponent = null;
@@ -404,6 +428,10 @@ class BridgeView extends ItemView {
     this.modelOptionsKey = "";
     this.effortOptionsKey = "";
     this.captureVersion = 0;
+    this.providerStates = new Map();
+    this.providerSubscriptions = new Map();
+    this.providerRefreshVersion = 0;
+    this.tasks = [];
     this.scope = new Scope(this.app.scope);
     this.scope.register(["Mod"], "Enter", event => {
       if (event.target !== this.input || event.isComposing || event.keyCode === 229) return;
@@ -420,14 +448,18 @@ class BridgeView extends ItemView {
     this.active = true;
     this.signature = null;
     this.latest = null;
+    this.tasks = [];
+    this.providerTasks = [];
+    this.providerDiscoveryComplete = false;
     this.autoCapture = this.app.loadLocalStorage(AUTO_CAPTURE) !== false;
     this.lastAutoSignature = "";
     this.repoManual = false;
     this.modelPrefs = loadModelPrefs(this.app);
     this.modelOptionsKey = "";
     this.effortOptionsKey = "";
+    this.executorKey = null;
+    this.modeKey = null;
     this.workspacePath = this.app.vault.adapter.getBasePath();
-    this.helper = path.join(this.workspacePath, this.plugin.manifest.dir, "bridge_client.py");
     if (!this.plugin.ensureCanvasContext() && this.plugin.canvasLoadError) {
       new Notice(`无法加载 Canvas 协作模块 · ${this.plugin.canvasLoadError}`);
     }
@@ -441,8 +473,8 @@ class BridgeView extends ItemView {
     title.createSpan({ text: "协作对话" });
     this.indicator = title.createSpan({ cls: "bc-connection", text: "正在连接" });
     this.vaultLabel = target.createDiv({ cls: "bc-vault", text: this.app.vault.getName() });
-    const refresh = iconButton(header, "refresh-cw", "刷新配对和指令");
-    refresh.onclick = () => this.refresh();
+    const refresh = iconButton(header, "refresh-cw", "刷新服务和指令");
+    refresh.onclick = async () => { await this.plugin.probeBridge(); await this.refresh(); };
     const historyLabel = this.contentEl.createDiv({ cls: "bc-section", text: "最近指令" });
     this.count = historyLabel.createSpan({ cls: "bc-count" });
     this.list = this.contentEl.createDiv({ cls: "bc-list", attr: { "aria-label": "最近指令" } });
@@ -471,6 +503,7 @@ class BridgeView extends ItemView {
       this.registerDomEvent(document, "keyup", () => this.scheduleAutoCapture());
     }
     this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.scheduleAutoCapture()));
+    this.plugin.openViews.add(this);
     this.updateComposer();
     this.scheduleAutoCapture(0);
     await this.refresh();
@@ -478,17 +511,16 @@ class BridgeView extends ItemView {
 
   buildCanvasControls() {
     const controls = this.form.createDiv({ cls: "bc-compose-options" });
-    this.executorButtons = segmented(controls, "执行者", EXECUTORS, value => this.setExecutor(value));
-    this.modeButtons = segmented(controls, "Canvas 模式", MODES, value => {
-      this.mode = value;
-      this.updateComposer();
-    });
-    const modelBar = this.form.createDiv({ cls: "bc-model-bar" });
-    const modelWrap = modelBar.createEl("label", { cls: "bc-model-wrap" });
-    modelWrap.createSpan({ text: "模型" });
-    this.modelSelect = modelWrap.createEl("select", { cls: "bc-model-select dropdown", attr: { "aria-label": "选择模型" } });
+    this.executorGroup = segmentGroup(controls, "执行者");
+    this.modeGroup = segmentGroup(controls, "Canvas 模式");
+    this.executorButtons = [];
+    this.modeButtons = [];
+    this.modelBar = this.form.createDiv({ cls: "bc-model-bar" });
+    this.modelWrap = this.modelBar.createEl("label", { cls: "bc-model-wrap" });
+    this.modelWrap.createSpan({ text: "模型" });
+    this.modelSelect = this.modelWrap.createEl("select", { cls: "bc-model-select dropdown", attr: { "aria-label": "选择模型" } });
     this.modelSelect.onchange = () => this.onModelChange();
-    this.effortWrap = modelBar.createEl("label", { cls: "bc-effort-wrap" });
+    this.effortWrap = this.modelBar.createEl("label", { cls: "bc-effort-wrap" });
     this.effortWrap.createSpan({ text: "强度" });
     this.effortSelect = this.effortWrap.createEl("select", { cls: "bc-effort-select dropdown", attr: { "aria-label": "选择推理强度" } });
     this.effortSelect.onchange = () => this.onEffortChange();
@@ -514,9 +546,50 @@ class BridgeView extends ItemView {
   }
 
   setExecutor(executor) {
+    if (this.executorGroup && !this.executorButtons.some(([id]) => id === executor)) return false;
     this.executor = executor;
     this.sendError = "";
     this.updateComposer();
+    return true;
+  }
+
+  activeProvider() { return this.plugin.providers?.get(this.executor); }
+
+  isBridgeExecutor() { return Object.hasOwn(EXECUTORS, this.executor); }
+
+  capabilities() {
+    return this.activeProvider()?.capabilities
+      || (this.isBridgeExecutor() ? { ...BRIDGE_CAPABILITIES, supportsEffort: this.executor === "codex" } : { modes: [] });
+  }
+
+  syncProviderControls() {
+    if (!this.executorGroup) return;
+    const adapters = this.plugin.providers?.listEnabled() || [];
+    const legacyRoute = this.route && !this.registration;
+    const options = Object.entries(EXECUTORS).filter(([id]) => legacyRoute || !this.plugin.providers
+      || adapters.some(adapter => adapter.id === id));
+    for (const adapter of adapters) {
+      if (Object.hasOwn(EXECUTORS, adapter.id)) continue;
+      const status = this.providerStates.get(adapter.id);
+      if (status?.adapter === adapter && status.value.available === false) continue;
+      options.push([adapter.id, adapter.label]);
+    }
+    if (this.providerDiscoveryComplete && !options.some(([id]) => id === this.executor)) {
+      this.executor = options.find(([id]) => this.providerStates.get(id)?.value.ready)?.[0] || options[0]?.[0] || "";
+      this.sendError = "";
+    }
+    const executorKey = JSON.stringify(options);
+    if (this.executorKey !== executorKey) {
+      this.executorKey = executorKey;
+      this.executorButtons = segmentButtons(this.executorGroup, options, value => this.setExecutor(value));
+    }
+    const modes = (this.capabilities().modes || []).map(id => [id, Object.hasOwn(MODES, id) ? MODES[id] : id]);
+    if (!modes.some(([id]) => id === this.mode)) this.mode = modes[0]?.[0] || "";
+    const modeKey = JSON.stringify(modes);
+    if (this.modeKey !== modeKey) {
+      this.modeKey = modeKey;
+      this.modeButtons = segmentButtons(this.modeGroup, modes, value => { this.mode = value; this.updateComposer(); });
+    }
   }
 
   codexModels() {
@@ -554,6 +627,19 @@ class BridgeView extends ItemView {
     return saved && list.some(item => item.id === saved) ? saved : "";
   }
 
+  providerStatus() {
+    const status = this.providerStates.get(this.executor);
+    return status?.adapter === this.activeProvider() ? status?.value : undefined;
+  }
+
+  selectedProviderModel() {
+    const { models = [], defaultModel } = this.providerStatus() || {};
+    const saved = this.modelPrefs[this.executor];
+    return models.includes(saved) ? saved : models.includes(defaultModel) ? defaultModel : models[0] || "";
+  }
+
+  effortPrefKey() { return this.executor === "codex" ? "codexEffort" : `${this.executor}:effort`; }
+
   syncModelSelectors() {
     if (!this.modelSelect) return;
     const isCodex = this.executor === "codex";
@@ -566,14 +652,18 @@ class BridgeView extends ItemView {
         options = [{ value: this.route.codex_model, label: this.route.codex_model, title: this.route.codex_model }];
       }
       selected = this.selectedCodexModel();
-    } else {
+    } else if (this.executor === "agy") {
       const defaultHint = this.route?.agy_default_model ? `参考默认：${this.route.agy_default_model}` : "使用当前桌面对话默认模型";
       options = [
         { value: "", label: "跟随当前对话（默认）", title: defaultHint },
         ...this.agyModels().map(m => ({ value: m.id, label: m.label || m.id, title: m.id })),
       ];
       selected = this.selectedAgyModel();
+    } else {
+      options = (this.providerStatus()?.models || []).map(model => ({ value: model, label: model }));
+      selected = this.selectedProviderModel();
     }
+    if (this.modelWrap) this.modelWrap.hidden = !options.length;
     const modelKey = JSON.stringify([this.executor, options]);
     if (modelKey !== this.modelOptionsKey) {
       this.modelOptionsKey = modelKey;
@@ -582,12 +672,14 @@ class BridgeView extends ItemView {
       this.modelSelect.value = selected;
     }
     if (!this.effortWrap || !this.effortSelect) return;
-    this.effortWrap.hidden = !isCodex;
-    if (!isCodex) return;
     const entry = this.codexModels().find(item => item.id === selected);
-    const efforts = Array.isArray(entry?.efforts) && entry.efforts.length ? entry.efforts : [];
+    const offeredEfforts = isCodex ? entry?.efforts : this.providerStatus()?.efforts;
+    const efforts = this.capabilities().supportsEffort && Array.isArray(offeredEfforts) ? offeredEfforts : [];
+    this.effortWrap.hidden = !efforts.length;
+    if (this.modelBar) this.modelBar.hidden = !options.length && !efforts.length;
     const effortOptions = efforts.map(e => ({ value: e, label: e, title: `推理强度 ${e}` }));
-    const selectedEffort = this.selectedCodexEffort();
+    const savedEffort = this.modelPrefs[this.effortPrefKey()];
+    const selectedEffort = isCodex ? this.selectedCodexEffort() : efforts.includes(savedEffort) ? savedEffort : efforts[0] || "";
     const effortKey = JSON.stringify(effortOptions);
     if (effortKey !== this.effortOptionsKey) {
       this.effortOptionsKey = effortKey;
@@ -606,7 +698,7 @@ class BridgeView extends ItemView {
 
   onEffortChange() {
     if (!this.effortSelect) return;
-    this.modelPrefs.codexEffort = this.effortSelect.value;
+    this.modelPrefs[this.effortPrefKey()] = this.effortSelect.value;
     this.app.saveLocalStorage(MODEL_PREFS, this.modelPrefs);
     this.updateComposer();
   }
@@ -669,34 +761,43 @@ class BridgeView extends ItemView {
   }
 
   isReady() {
-    return this.executor === "codex" ? this.route?.codex_ready : this.route?.paired;
+    if (this.isBridgeExecutor()) return this.executor === "codex" ? this.route?.codex_ready : this.route?.paired;
+    const status = this.providerStatus();
+    return Boolean(status?.ready && this.mode && this.activeProvider()?.enabled !== false);
   }
 
   updateComposer() {
+    this.syncProviderControls();
     const state = this.route;
     const ready = Boolean(this.isReady());
     const isCodex = this.executor === "codex";
+    const label = this.plugin.providerLabel(this.executor);
+    const status = this.providerStatus();
+    const hasProvider = Boolean(this.executor) && !this.isBridgeExecutor();
     const connection = isCodex ? (ready ? "Codex 就绪" : "Codex 未就绪") : (ready ? "AGY 已配对" : "AGY 待配对");
-    this.indicator.setText(state ? connection : this.connectionError ? "连接中断" : "正在连接");
+    const connectionText = hasProvider ? `${label} ${ready ? "就绪" : status ? "未就绪" : "正在连接"}`
+      : state ? connection : this.bridgeError ? "连接中断" : this.executor ? "正在连接" : "没有可用的执行者";
+    this.indicator.setText(connectionText);
     this.indicator.dataset.ready = String(ready);
     const codexModel = this.selectedCodexModel() || state?.codex_model;
     const agyModel = this.selectedAgyModel();
-    this.vaultLabel.title = isCodex
+    this.vaultLabel.title = hasProvider ? this.workspacePath : isCodex
       ? [this.workspacePath, codexModel, this.selectedCodexEffort()].filter(Boolean).join("\n")
       : state?.paired
         ? `${this.workspacePath}\n项目 ${state.project}\n对话 ${state.conversation}${agyModel ? `\n指定模型 ${agyModel}` : ""}`
         : this.workspacePath;
-    const routeError = state && !ready && (isCodex
+    const routeError = this.isBridgeExecutor() && state && !ready && (isCodex
       ? state.codex_error || "请先在 Codex 路由设置中配置有效的 worker_profile.model。"
       : state.reason || "请在 Codex 中为本仓库配对 Antigravity 桌面对话。");
-    this.feedback.setText(this.sendError || this.connectionError || routeError || "");
-    this.input.placeholder = `给 ${EXECUTORS[this.executor]} 下指令…`;
+    this.feedback.setText(this.sendError || (hasProvider ? status?.message : this.bridgeError || routeError)
+      || (!this.executor && this.providerDiscoveryComplete ? this.plugin.providerLoadError || PROVIDER_GUIDANCE : ""));
+    this.input.placeholder = label ? `给 ${label} 下指令…` : "输入协作指令…";
     const snapshot = this.context?.snapshot;
     this.selectionLabel.setText(snapshot
       ? `${path.basename(snapshot.canvasPath)} · ${snapshot.effectiveNodeIds.length} 节点（分组展开 ${snapshot.expandedFromGroupIds.length}） · ${snapshot.internalEdges.length + snapshot.incomingEdges.length + snapshot.outgoingEdges.length} 连线`
       : "Canvas 未选取");
     this.selectionLabel.title = snapshot?.canvasPath || "";
-    this.repoRow.hidden = !snapshot;
+    this.repoRow.hidden = !snapshot || !this.capabilities().supportsRepo;
     this.clear.hidden = !snapshot;
     this.syncModelSelectors();
     this.updateButton();
@@ -761,12 +862,13 @@ class BridgeView extends ItemView {
   }
 
   showTasks(tasks) {
+    this.tasks = tasks;
     const signature = JSON.stringify([tasks, this.plugin.appliedPatches]);
     if (signature === this.signature) return;
     this.signature = signature;
-    const expanded = new Set(Array.from(this.list.querySelectorAll("details.bc-task[open]"), el => el.dataset.request));
+    const expanded = new Set(Array.from(this.list.querySelectorAll("details.bc-task[open]"), el => el.dataset.taskKey));
     const scroll = this.list.scrollTop;
-    const newest = tasks[0]?.id;
+    const newest = tasks.length ? taskKey(tasks[0]) : undefined;
     const arrived = newest && newest !== this.latest;
     if (arrived) expanded.delete(this.latest);
     this.clearRenderComponent();
@@ -777,7 +879,10 @@ class BridgeView extends ItemView {
     this.list.empty();
     this.count.setText(String(tasks.length));
     if (!tasks.length) this.list.createDiv({ cls: "bc-empty", text: "还没有协作指令。" });
-    for (const task of tasks) addTask(this, task, expanded.has(task.id) || (arrived && task.id === newest));
+    for (const task of tasks) {
+      const key = taskKey(task);
+      addTask(this, task, expanded.has(key) || (arrived && key === newest));
+    }
     this.list.scrollTop = arrived ? 0 : scroll;
     this.latest = newest;
   }
@@ -795,7 +900,7 @@ class BridgeView extends ItemView {
       actions.createSpan({ cls: "bc-task-error", text: "这条指令没有锁定 Canvas 选区。" });
       return;
     }
-    const key = `${task.executor || "agy"}:${task.id}`;
+    const key = taskKey(task);
     const applied = Object.hasOwn(this.plugin.appliedPatches, key);
     const appliedRecord = applied ? this.plugin.appliedPatches[key] : null;
     const canRevert = Boolean(appliedRecord && typeof appliedRecord === "object" && appliedRecord.undo);
@@ -808,7 +913,7 @@ class BridgeView extends ItemView {
           try {
             const summary = await this.plugin.revertReplyPatch(key);
             if (summary) new Notice(`已撤销 Canvas 补丁 · ${revertCounts(summary)}`);
-            if (this.active) this.showTasks(this.route?.tasks || []);
+            if (this.active) this.showTasks(this.tasks);
           } catch (error) {
             revert.disabled = false;
             new Notice(`撤销 Canvas 补丁失败 · ${error.message}`);
@@ -826,7 +931,7 @@ class BridgeView extends ItemView {
       try {
         const summary = await this.plugin.applyReplyPatch(key, context, patch);
         if (summary) new Notice(`Canvas 补丁已应用 · ${patchCounts(summary)}`);
-        if (this.active) this.showTasks(this.route?.tasks || []);
+        if (this.active) this.showTasks(this.tasks);
       } catch (error) {
         button.disabled = false;
         new Notice(`Canvas 补丁应用失败 · ${error.message}`);
@@ -834,45 +939,146 @@ class BridgeView extends ItemView {
     };
   }
 
-  async refresh() {
+  updateHistory() {
     if (!this.active) return;
-    if (this.loading) { this.refreshAgain = true; return; }
-    this.loading = true;
-    try {
-      this.registration ??= await bridgeRegistration();
-      if (!this.active) return;
-      if (!this.fallback) this.startWatching();
-      const state = await callBridge(this.registration, this.helper, this.workspacePath, { action: "snapshot" });
-      if (!this.active) return;
-      this.route = state;
-      this.connectionError = "";
-      this.showTasks(state.tasks);
-      this.hasRunningJob = state.tasks.some(task => task.executor === "codex" && task.status === "running");
-    } catch (error) {
-      if (!this.active) return;
-      this.route = null;
+    const tasks = [...(this.route?.tasks || []), ...(this.providerTasks || [])];
+    const timestamp = task => new Date(task.time).getTime() || 0;
+    this.showTasks(tasks.sort((a, b) => timestamp(b) - timestamp(a)).slice(0, 30));
+    this.updateComposer();
+  }
+
+  syncSubscriptions(adapters) {
+    for (const [adapter, stop] of this.providerSubscriptions) {
+      if (adapters.includes(adapter)) continue;
+      this.providerSubscriptions.delete(adapter);
+      try { stop(); } catch (error) { console.error(error); }
+    }
+    for (const adapter of adapters) {
+      if (!adapter.subscribe || this.providerSubscriptions.has(adapter)) continue;
+      try {
+        const stop = adapter.subscribe(this.workspacePath, () => void this.refreshProviders());
+        if (typeof stop === "function") this.providerSubscriptions.set(adapter, stop);
+      } catch (error) { console.error(error); }
+    }
+  }
+
+  async refreshProviders() {
+    const version = ++this.providerRefreshVersion;
+    await this.plugin.settingsReady;
+    if (!this.active || version !== this.providerRefreshVersion) return;
+    const adapters = (this.plugin.providers?.list() || []).filter(adapter => !Object.hasOwn(EXECUTORS, adapter.id));
+    this.syncSubscriptions(adapters.filter(adapter => adapter.enabled !== false));
+    const results = await Promise.all(adapters.map(async adapter => {
+      const [status, tasks] = await Promise.allSettled([
+        Promise.resolve().then(() => adapter.enabled === false ? {} : adapter.getStatus(this.workspacePath)),
+        Promise.resolve().then(() => adapter.listTasks(this.workspacePath)),
+      ]);
+      const reported = status.status === "fulfilled" ? status.value : undefined;
+      const value = {
+        ...reported,
+        ready: Boolean((reported?.ready ?? reported?.available) && reported?.available !== false),
+        models: Array.isArray(reported?.models) ? reported.models : [],
+        message: reported?.message || reported?.error || (status.status === "rejected" ? String(status.reason?.message || status.reason) : ""),
+      };
+      return { adapter, value, tasks: tasks.status === "fulfilled" && Array.isArray(tasks.value) ? tasks.value : [] };
+    }));
+    if (!this.active || version !== this.providerRefreshVersion) return;
+    const current = results.filter(({ adapter }) => this.plugin.providers.get(adapter.id) === adapter);
+    this.providerStates = new Map(current.map(({ adapter, value }) => [adapter.id, { adapter, value }]));
+    this.providerTasks = current.flatMap(({ adapter, tasks }) => tasks.filter(task => task?.id != null).map(task => ({
+      ...task, executor: adapter.id, providerLabel: task.providerLabel || adapter.label,
+    })));
+    this.providerDiscoveryComplete = true;
+    try { this.updateHistory(); } catch (error) { this.showRefreshError(error); }
+  }
+
+  stopWatching() {
+    this.watcher?.close();
+    this.watcher = null;
+    window.clearInterval(this.fallback);
+    this.fallback = null;
+    window.clearTimeout(this.jobPoll);
+  }
+
+  async refreshBridge() {
+    const registration = this.plugin.bridgeConnection;
+    if (!registration) {
+      this.stopWatching();
       this.registration = null;
-      this.connectionError = error.message;
+      this.route = null;
+      this.bridgeError = "";
+      this.updateHistory();
+      return;
+    }
+    if (registration !== this.registration) this.stopWatching();
+    this.registration = registration;
+    if (!this.fallback) this.startWatching();
+    try {
+      const state = await this.plugin.bridgeSnapshot(this.workspacePath);
+      if (!this.active || registration !== this.plugin.bridgeConnection) return;
+      this.route = state;
+      this.bridgeError = "";
+    } catch (error) {
+      if (!this.active || registration !== this.plugin.bridgeConnection) return;
+      this.route = null;
+      this.bridgeError = error.message;
     } finally {
-      this.loading = false;
-      if (this.active) {
-        this.updateComposer();
+      if (this.active && registration === this.plugin.bridgeConnection) {
+        this.updateHistory();
         window.clearTimeout(this.jobPoll);
-        if (!this.fallback && this.hasRunningJob) this.jobPoll = window.setTimeout(() => this.refresh(), 5000);
-        if (this.refreshAgain) { this.refreshAgain = false; this.scheduleRefresh(); }
+        if (!this.fallback && this.route?.tasks?.some(task => task.executor === "codex" && task.status === "running")) {
+          this.jobPoll = window.setTimeout(() => this.refresh(), 5000);
+        }
       }
     }
   }
 
+  refresh() {
+    if (!this.active) return;
+    if (this.refreshPromise) {
+      this.refreshAgain = true;
+      return this.refreshPromise;
+    }
+    this.refreshPromise = (async () => {
+      await this.plugin.settingsReady;
+      do {
+        this.refreshAgain = false;
+        if (!this.active) return;
+        await Promise.all([this.refreshBridge(), this.refreshProviders()]);
+      } while (this.active && this.refreshAgain);
+    })().catch(error => this.showRefreshError(error)).finally(() => { this.refreshPromise = null; });
+    return this.refreshPromise;
+  }
+
+  showRefreshError(error) {
+    if (!this.active) return;
+    this.sendError = error?.message || String(error);
+    this.feedback.setText(this.sendError);
+  }
+
   dispatchPayload(instruction) {
     const selected = this.context;
-    const targetWorkspace = selected ? this.repo.value.trim() || this.workspacePath : this.workspacePath;
+    const { supportsRepo, modes } = this.capabilities();
+    const targetWorkspace = selected && supportsRepo ? this.repo.value.trim() || this.workspacePath : this.workspacePath;
     const executor = this.executor;
-    const mode = selected ? this.mode : "execute_task";
+    const mode = !selected && modes?.includes("execute_task") ? "execute_task" : this.mode;
     const text = selected ? this.plugin.canvasContext.buildCanvasPromptEnvelope({
-      userInstruction: instruction, executor, mode, canvasSnapshot: selected.snapshot,
-      fileExcerpts: selected.fileExcerpts, targetRepo: targetWorkspace,
+      userInstruction: instruction, executor, mode,
+      canvasSnapshot: supportsRepo ? selected.snapshot : { ...selected.snapshot, detectedRepo: "" },
+      fileExcerpts: selected.fileExcerpts, targetRepo: supportsRepo ? targetWorkspace : "",
     }) : instruction;
+    const canvasPath = selected?.snapshot.canvasPath || "";
+    const selectedIds = selected?.snapshot.effectiveNodeIds || [];
+    if (!this.isBridgeExecutor()) {
+      const label = this.plugin.providerLabel(executor).replace(/[\r\n]+/g, " ");
+      return {
+        workspace: this.workspacePath, targetWorkspace, executor, mode,
+        // The shared envelope uses the legacy AGY label for non-Codex executors.
+        prompt: selected ? text.replace(/\n执行者 AGY · 模式 /, () => `\n执行者 ${label} · 模式 `) : text,
+        canvasPath, selectedIds, source: "Obsidian", model: this.selectedProviderModel(),
+        ...(this.capabilities().supportsEffort && this.effortSelect?.value ? { effort: this.effortSelect.value } : {}),
+      };
+    }
     if (executor === "agy") {
       const model = this.selectedAgyModel();
       return {
@@ -886,13 +1092,14 @@ class BridgeView extends ItemView {
       action: "dispatch_codex", text, mode, target_workspace: targetWorkspace,
       ...(model ? { model } : {}), ...(effort ? { effort } : {}),
       step_goal: selected ? `Obsidian Canvas：${MODES[mode]}` : "处理 Obsidian 指令",
-      canvas_path: selected?.snapshot.canvasPath || "", selected_ids: selected?.snapshot.effectiveNodeIds || [],
+      canvas_path: canvasPath, selected_ids: selectedIds,
     };
   }
 
   async send() {
     const text = this.input.value.trim();
     if (!text || !this.isReady() || this.sending) return;
+    const refresh = this.isBridgeExecutor() ? () => this.refresh() : () => this.refreshProviders();
     this.sending = true;
     this.sendError = "";
     this.updateComposer();
@@ -902,7 +1109,17 @@ class BridgeView extends ItemView {
       const token = this.draft.intent && this.draft.intent !== intent ? randomUUID() : this.draft.token;
       this.draft = { ...this.draft, token, intent };
       this.app.saveLocalStorage(DRAFT, this.draft);
-      await callBridge(this.registration, this.helper, this.workspacePath, { ...payload, token });
+      const provider = this.activeProvider();
+      const result = provider
+        ? await provider.dispatch({ ...payload, workspace: this.workspacePath, token })
+        : await this.plugin.callBridge(this.workspacePath, { ...payload, token });
+      if (result?.ok === false) throw new Error(result.error || "执行者未接受指令。");
+      if (result?.settled) {
+        void Promise.resolve(result.settled).then(
+          refresh,
+          error => { if (this.active) { this.sendError = error?.message || String(error); this.updateComposer(); } },
+        );
+      }
       if (this.app.loadLocalStorage(DRAFT)?.token === token) this.app.saveLocalStorage(DRAFT, null);
       this.draft = { token: randomUUID(), text: "" };
       if (this.active) this.input.value = "";
@@ -912,31 +1129,125 @@ class BridgeView extends ItemView {
       this.sending = false;
       if (this.active) {
         this.updateComposer();
-        await this.refresh();
+        await refresh();
       }
     }
   }
 
   async onClose() {
     this.active = false;
+    this.providerRefreshVersion++;
+    this.plugin.openViews.delete(this);
+    this.syncSubscriptions([]);
     this.clearRenderComponent();
     this.captureVersion++;
-    this.watcher?.close();
-    this.watcher = null;
+    this.stopWatching();
     window.clearTimeout(this.timer);
     window.clearTimeout(this.autoTimer);
-    window.clearTimeout(this.jobPoll);
-    window.clearInterval(this.fallback);
-    this.fallback = null;
   }
 }
+
+const CanvasBridgeSettingTab = typeof PluginSettingTab === "function" && typeof Setting === "function"
+  ? class extends PluginSettingTab {
+    constructor(app, plugin) { super(app, plugin); this.plugin = plugin; }
+
+    display() {
+      const { containerEl, plugin } = this;
+      containerEl.empty();
+      if (!plugin.settings) {
+        containerEl.createDiv({ text: "无法加载 Canvas Bridge 服务配置。" });
+        return;
+      }
+      new Setting(containerEl).setName("OpenAI 兼容服务").setHeading()
+        .addButton(button => button.setButtonText("添加服务").onClick(async () => {
+          const defaults = plugin.providerModule.DEFAULT_SETTINGS.openaiProviders[0];
+          const profile = { ...defaults, name: "OpenAI 兼容服务", id: `openai-${randomUUID()}` };
+          await this.save({ ...plugin.settings, openaiProviders: [...plugin.settings.openaiProviders, profile] });
+          this.display();
+        }));
+      for (const profile of plugin.settings.openaiProviders) this.addProfile(profile);
+
+      new Setting(containerEl).setName("Codex-Antigravity-Bridge（可选）").setHeading();
+      const bridge = new Setting(containerEl).setName("启用本机桥接");
+      this.bridgeStatus = bridge;
+      this.updateBridgeStatus();
+      bridge.addToggle(toggle => toggle.setValue(plugin.settings.enableBridge).onChange(async enableBridge => {
+        await this.save({ ...plugin.settings, enableBridge });
+        this.updateBridgeStatus();
+      }));
+    }
+
+    updateBridgeStatus() {
+      const { plugin } = this;
+      this.bridgeStatus?.setDesc(!plugin.settings?.enableBridge ? "已停用"
+        : plugin.bridgeProbe ? "正在检测本机桥接…" : plugin.bridgeConnection ? "已检测到本机桥接" : "未检测到本机桥接");
+    }
+
+    async save(settings) {
+      try { await this.plugin.updateSettings(settings); }
+      catch (error) { new Notice(`保存 Canvas Bridge 设置失败 · ${error.message}`); }
+    }
+
+    addProfile(profile) {
+      const { containerEl, plugin } = this;
+      const card = containerEl.createDiv({ cls: "bc-settings-card" });
+      const change = patch => this.save({
+        ...plugin.settings,
+        openaiProviders: plugin.settings.openaiProviders.map(item => item.id === profile.id ? { ...item, ...patch } : item),
+      });
+      new Setting(card).setName("启用服务")
+        .addToggle(toggle => toggle.setValue(profile.enabled).onChange(enabled => change({ enabled })));
+      new Setting(card).setName("名称")
+        .addText(text => text.setValue(profile.name).onChange(name => change({ name })));
+      new Setting(card).setName("Base URL")
+        .setDesc("例如 https://api.openai.com/v1，或本机服务的兼容 API 地址。")
+        .addText(text => text.setValue(profile.baseUrl).onChange(baseUrl => change({ baseUrl })));
+      new Setting(card).setName("API Key").setDesc("本机服务无需密钥时可留空。")
+        .addText(text => {
+          text.inputEl.type = "password";
+          text.inputEl.autocomplete = "off";
+          text.setValue(profile.apiKey).onChange(apiKey => change({ apiKey }));
+        });
+      new Setting(card).setName("模型").setDesc("用逗号或换行分隔。")
+        .addTextArea(text => text.setValue(profile.models.join("\n")).onChange(models => change({ models })));
+      new Setting(card).setName("系统提示词（可选）")
+        .addTextArea(text => text.setValue(profile.systemPrompt).onChange(systemPrompt => change({ systemPrompt })));
+      const actions = card.createDiv({ cls: "bc-settings-actions" });
+      actions.createEl("button", { text: "测试连接", attr: { type: "button" } }).onclick = async event => {
+        const latest = plugin.settings.openaiProviders.find(item => item.id === profile.id);
+        if (!latest) return;
+        const button = event.currentTarget;
+        button.disabled = true;
+        try {
+          await plugin.createHttpProvider(latest).testConnection();
+          new Notice(`${latest.name} 连接成功`);
+        } catch (error) {
+          new Notice(`${latest.name} 连接失败 · ${error.message}`);
+        } finally {
+          button.disabled = false;
+        }
+      };
+      actions.createEl("button", { cls: "mod-warning", text: "移除服务", attr: { type: "button" } }).onclick = async () => {
+        await this.save({ ...plugin.settings, openaiProviders: plugin.settings.openaiProviders.filter(item => item.id !== profile.id) });
+        this.display();
+      };
+    }
+  } : null;
 
 module.exports = class BridgeChatPlugin extends Plugin {
   onload() {
     this.appliedPatches = this.app.loadLocalStorage(APPLIED) || {};
     this.applyingCanvases = new Set();
+    this.openViews = new Set();
+    this.httpProviders = new Map();
+    this.bridgeProviders = new Map();
     this.canvasLoadError = "";
     this.ensureCanvasContext();
+    this.settingsReady = this.initializeProviders();
+    if (CanvasBridgeSettingTab && this.addSettingTab) {
+      this.settingsTab = new CanvasBridgeSettingTab(this.app, this);
+      this.addSettingTab(this.settingsTab);
+    }
     this.lastCanvasLeaf = this.app.workspace.getMostRecentLeaf();
     this.registerView(VIEW, leaf => new BridgeView(leaf, this));
     this.addRibbonIcon("messages-square", "打开协作对话", () => this.openPanel());
@@ -958,6 +1269,151 @@ module.exports = class BridgeChatPlugin extends Plugin {
     }));
     this.registerCanvasMenu("canvas:node-menu", node => ({ canvas: node?.canvas, ids: selectionIds([node]) }));
     this.registerCanvasMenu("canvas:selection-menu", canvas => ({ canvas, ids: selectionIds(canvas?.selection) }));
+    return this.settingsReady;
+  }
+
+  pluginDir() {
+    const dir = this.manifest?.dir;
+    if (!dir) return null;
+    if (path.isAbsolute(dir)) return dir;
+    const basePath = this.app?.vault?.adapter?.getBasePath?.();
+    return basePath ? path.join(basePath, dir) : null;
+  }
+
+  async initializeProviders() {
+    const dir = this.pluginDir();
+    if (!dir) return;
+    try {
+      this.providerModule = loadLocalModule(dir, "providers.js", LOCAL_BUILTINS);
+      const { ProviderRegistry, LocalTaskStore, normalizeSettings } = this.providerModule;
+      this.providers = new ProviderRegistry();
+      this.localTaskStore = new LocalTaskStore({
+        load: () => this.app.loadLocalStorage?.(PROVIDER_TASKS),
+        save: tasks => this.app.saveLocalStorage?.(PROVIDER_TASKS, tasks),
+      });
+      this.settings = normalizeSettings();
+      if (typeof this.loadData === "function") {
+        try { this.settings = normalizeSettings(await this.loadData()); }
+        catch (error) { new Notice(`读取 Canvas Bridge 设置失败 · ${error.message}`); }
+      }
+      this.syncHttpProviders();
+      this.settingsLoaded = true;
+      await this.probeBridge();
+    } catch (error) {
+      this.providerLoadError = error.message || String(error);
+      if (typeof Notice === "function") new Notice(`无法加载 Canvas Bridge 服务 · ${this.providerLoadError}`);
+    }
+  }
+
+  registerProvider(adapter) {
+    if (Object.hasOwn(EXECUTORS, adapter?.id) || this.httpProviders.has(adapter?.id)) {
+      throw new Error(`执行者 ID 已由 Canvas Bridge 使用：${adapter.id}`);
+    }
+    const registered = this.providers.register(adapter);
+    this.refreshProviderViews();
+    return registered;
+  }
+
+  unregisterProvider(id) {
+    const removed = this.providers?.unregister(id) || false;
+    if (removed) this.refreshProviderViews();
+    return removed;
+  }
+
+  getProviders() { return this.providers?.list() || []; }
+
+  providerLabel(id) { return this.providers?.get(id)?.label || (Object.hasOwn(EXECUTORS, id) ? EXECUTORS[id] : id); }
+
+  async updateSettings(nextSettings) {
+    if (!this.settingsLoaded) await this.settingsReady;
+    if (!this.settings) throw new Error("无法加载 Canvas Bridge 服务配置。");
+    const previousEnableBridge = this.settings.enableBridge;
+    const settings = this.providerModule.normalizeSettings({ ...this.settings, ...nextSettings });
+    this.settings = settings;
+    this.syncHttpProviders();
+    const saved = (this.settingsSave || Promise.resolve()).catch(() => {}).then(() => this.saveData?.(settings));
+    this.settingsSave = saved;
+    const probe = previousEnableBridge !== settings.enableBridge ? this.probeBridge() : undefined;
+    this.refreshProviderViews();
+    await Promise.all([saved, probe]);
+    return settings;
+  }
+
+  createHttpProvider(config) {
+    return this.providerModule.createOpenAICompatibleProvider(config, {
+      store: this.localTaskStore,
+      requestFn: requestHttp,
+      notify: () => this.refreshProviderViews(),
+    });
+  }
+
+  syncHttpProviders() {
+    for (const [id, adapter] of this.httpProviders) {
+      if (this.providers.get(id) === adapter) this.providers.unregister(id);
+    }
+    this.httpProviders.clear();
+    for (const config of this.settings.openaiProviders) {
+      if (Object.hasOwn(EXECUTORS, config.id) || this.providers.get(config.id)) continue;
+      const adapter = this.providers.register(this.createHttpProvider(config));
+      this.httpProviders.set(adapter.id, adapter);
+    }
+  }
+
+  refreshProviderViews() {
+    for (const view of this.openViews) void view.refreshProviders();
+  }
+
+  probeBridge() {
+    if (!this.settings?.enableBridge) {
+      this.setBridgeConnection(null);
+      return;
+    }
+    if (!this.bridgeProbe) {
+      this.bridgeProbe = bridgeRegistration().catch(() => null).then(connection => {
+        if (this.settings.enableBridge) this.setBridgeConnection(connection);
+      }).finally(() => {
+        this.bridgeProbe = null;
+        this.settingsTab?.updateBridgeStatus();
+      });
+    }
+    return this.bridgeProbe;
+  }
+
+  setBridgeConnection(connection) {
+    if (this.bridgeConnection?.server === connection?.server && this.bridgeConnection?.python === connection?.python) return;
+    this.bridgeConnection = connection;
+    this.bridgeSnapshots = new Map();
+    for (const [id, adapter] of this.bridgeProviders) {
+      if (this.providers.get(id) === adapter) this.providers.unregister(id);
+    }
+    this.bridgeProviders.clear();
+    if (connection) {
+      for (const [id, label] of Object.entries(EXECUTORS)) {
+        const adapter = this.providers.register({
+          id, label, kind: "bridge", capabilities: { ...BRIDGE_CAPABILITIES, supportsEffort: id === "codex" },
+          getStatus: workspace => {
+            const state = this.bridgeSnapshots.get(workspace);
+            return { ready: Boolean(id === "codex" ? state?.codex_ready : state?.paired) };
+          },
+          listTasks: workspace => (this.bridgeSnapshots.get(workspace)?.tasks || []).filter(task => (task.executor || "agy") === id),
+          dispatch: ({ workspace, ...payload }) => this.callBridge(workspace, payload),
+        });
+        this.bridgeProviders.set(id, adapter);
+      }
+    }
+    for (const view of this.openViews) void view.refresh();
+  }
+
+  callBridge(workspace, payload) {
+    if (!this.bridgeConnection) throw new Error(PROVIDER_GUIDANCE);
+    return callBridge(this.bridgeConnection, path.join(this.pluginDir(), "bridge_client.py"), workspace, payload);
+  }
+
+  async bridgeSnapshot(workspace) {
+    const connection = this.bridgeConnection;
+    const state = await this.callBridge(workspace, { action: "snapshot" });
+    if (connection === this.bridgeConnection) this.bridgeSnapshots.set(workspace, state);
+    return state;
   }
 
   registerCanvasMenu(event, context) {
@@ -972,7 +1428,7 @@ module.exports = class BridgeChatPlugin extends Plugin {
       const view = await this.openPanel();
       if (!view || view.sending || !await view.captureSelection(hint)) return;
       if (executor) {
-        view.setExecutor(executor);
+        if (view.setExecutor(executor) === false) { new Notice(PROVIDER_GUIDANCE); return; }
         if (view.input.value.trim()) await view.send();
       }
       view.input.focus();
@@ -983,11 +1439,14 @@ module.exports = class BridgeChatPlugin extends Plugin {
 
   ensureCanvasContext() {
     if (this.canvasContext) return this.canvasContext;
-    const basePath = this.app?.vault?.adapter?.getBasePath?.();
-    const dir = this.manifest?.dir;
-    if (!basePath || !dir) return null;
+    const dir = this.pluginDir();
+    if (!dir) return null;
     try {
-      this.canvasContext = loadCanvasContext(path.join(basePath, dir));
+      const context = loadLocalModule(dir, "canvas_context.js", LOCAL_BUILTINS);
+      if (typeof context?.extractSelectionSnapshot !== "function" || typeof context.applyCanvasPatch !== "function") {
+        throw new Error("canvas_context.js 导出接口不完整。");
+      }
+      this.canvasContext = context;
       this.canvasLoadError = "";
       return this.canvasContext;
     } catch (error) {

@@ -16,7 +16,7 @@ class FakeElement {
     this.attributes = {};
     this.style = { setProperty: (name, value) => { this.style[name] = value; } };
     const classes = new Set((options.cls || "").split(/\s+/).filter(Boolean));
-    this.classList = { remove: name => classes.delete(name), contains: name => classes.has(name) };
+    this.classList = { add: name => classes.add(name), remove: name => classes.delete(name), contains: name => classes.has(name) };
     this.textContent = options.text || "";
     this.open = false;
     this.listeners = new Map();
@@ -25,6 +25,7 @@ class FakeElement {
 
   setAttribute(name, value) { this.attributes[name] = String(value); }
   getAttribute(name) { return this.attributes[name] ?? null; }
+  addClass(name) { this.classList.add(name); }
   setText(text) { this.textContent = String(text ?? ""); this.children = []; }
   appendChild(child) { child.parentElement = this; this.children.push(child); return child; }
   createEl(tag, options = {}) { return this.appendChild(new FakeElement(tag, options)); }
@@ -44,6 +45,7 @@ class FakeElement {
     ]);
   }
   querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+  get options() { return this.children; }
   get innerText() { return [this.textContent, ...this.children.map(child => child.innerText)].filter(Boolean).join(""); }
 }
 
@@ -54,6 +56,9 @@ function setup(options = {}) {
   const leaves = [];
   const commands = [];
   const saved = new Map();
+  const notices = [];
+  const writes = [];
+  const pluginDir = path.join(__dirname, "..");
   const app = {
     workspace: {
       getLeavesOfType: type => leaves.filter(leaf => leaf.view.getViewType() === type),
@@ -65,34 +70,70 @@ function setup(options = {}) {
     saveLocalStorage: (key, value) => saved.set(key, value),
   };
   class Plugin {
-    constructor() { this.app = app; }
+    constructor() {
+      this.app = app;
+      if (options.realModules) this.manifest = { dir: path.basename(pluginDir) };
+    }
     registerView(type, create) { viewTypes.set(type, create); }
     addRibbonIcon() {}
     addCommand(command) { commands.push(command.id); }
     registerEvent() {}
   }
   class ItemView {
-    constructor() { this.app = app; this.children = []; }
+    constructor() { this.app = app; this.children = []; this.contentEl = new FakeElement(); }
     addChild(child) { this.children.push(child); return child; }
     removeChild(child) { this.children = this.children.filter(item => item !== child); child.unload?.(); }
+    registerDomEvent() {}
+    registerEvent() {}
   }
   class Scope { register() {} }
   class Component { constructor() { this.unloaded = false; } unload() { this.unloaded = true; } }
   const obsidian = { Plugin, ItemView, Scope, setIcon() {} };
+  if (options.realModules) {
+    app.vault.adapter = { getBasePath: () => path.dirname(pluginDir) };
+    app.vault.getName = () => "Example Vault";
+    obsidian.Notice = class { constructor(text) { notices.push(text); } };
+    obsidian.requestUrl = options.requestUrl;
+    Plugin.prototype.loadData = async () => options.settings;
+    Plugin.prototype.saveData = async value => { writes.push(JSON.parse(JSON.stringify(value))); };
+  }
+  Object.assign(obsidian, options.obsidian);
+  if (options.obsidian?.PluginSettingTab) {
+    Plugin.prototype.addSettingTab = function (tab) { this.registeredSettingsTab = tab; };
+  }
   if (options.render) {
     obsidian.Component = Component;
     obsidian.MarkdownRenderer = { render: options.render };
   }
+  const files = [];
+  const obsidianRequire = name => {
+    if (name === "obsidian") return obsidian;
+    if (!options.realModules) return require(name);
+    if (name === "node:fs") return {
+      readFileSync(filename, encoding) { files.push(path.basename(filename)); return fs.readFileSync(filename, encoding); },
+      promises: { async readFile(filename) {
+        assert.equal(path.basename(filename), "mcp_config.json");
+        if (options.bridgeConfig) return JSON.stringify(options.bridgeConfig);
+        throw Object.assign(new Error("missing MCP config"), { code: "ENOENT" });
+      } },
+      watch: options.watch,
+    };
+    if (name === "node:child_process" && options.execFile) return { execFile: options.execFile };
+    if (["node:child_process", "node:crypto", "node:os", "node:path"].includes(name)) return require(name);
+    throw new Error(`Obsidian require cannot resolve module: ${name}`);
+  };
   vm.runInNewContext(main, {
     module,
+    URL,
+    fetch: options.fetch,
     window: { setTimeout, clearTimeout, setInterval, clearInterval },
-    require: name => name === "obsidian" ? obsidian : require(name),
+    require: obsidianRequire,
   });
   const plugin = new module.exports();
-  plugin.canvasContext = canvasContext;
+  if (!options.realModules) plugin.canvasContext = canvasContext;
   plugin.onload();
   return {
-    plugin, app, events, leaves, commands, saved,
+    plugin, app, events, leaves, commands, saved, notices, writes, files, obsidianRequire,
     createView: () => viewTypes.get("obsidian-canvas-bridge")({}),
   };
 }
@@ -590,4 +631,283 @@ test("defaults to edit_canvas mode, applies/reverts safely via importData + push
   const revClosed = await plugin.revertReplyPatch("codex:layout-closed");
   assert.equal(revClosed.restoredNodes, 1);
   assert.deepEqual([JSON.parse(disk).nodes[0].x, JSON.parse(disk).nodes[0].text], [0, "before"]);
+});
+
+test("loads both standalone modules under a restricted Obsidian require", async () => {
+  const { plugin, files, obsidianRequire } = setup({ realModules: true });
+  await plugin.settingsReady;
+  assert.equal(obsidianRequire.cache, undefined);
+  assert.throws(() => obsidianRequire("./providers.js"), /cannot resolve/);
+  assert.deepEqual(files, ["canvas_context.js", "providers.js"]);
+  assert.equal(typeof plugin.canvasContext.applyCanvasPatch, "function");
+  assert.equal(typeof plugin.providerModule.normalizeChatCompletionsUrl, "function");
+  assert.deepEqual(Array.from(plugin.getProviders(), item => item.id), ["openai-compatible"]);
+});
+
+test("queues an HTTP Canvas task with no Bridge configuration, renders the reply, and applies and reverts the patch", async t => {
+  let resolveRequest;
+  const requests = [];
+  const { plugin, createView, app, leaves, saved } = setup({
+    realModules: true,
+    settings: { openaiProviders: [{ id: "local-api", name: "Local API", enabled: true, models: "one,two", defaultModel: "two" }] },
+    requestUrl: request => { requests.push(request); return new Promise(resolve => { resolveRequest = resolve; }); },
+    render: (_app, text, el) => { el.createEl("h1", { text: text.replace(/^# /, "") }); },
+  });
+  const file = { path: "Draft.canvas", extension: "canvas" };
+  const selected = { id: "chosen" };
+  let liveData = { nodes: [card("chosen", { text: "Before" }), card("outside", { text: "Outside" })], edges: [] };
+  let focused;
+  let saves = 0;
+  leaves.push(leaf(file, {
+    selection: new Set([selected]), nodes: new Map([[selected.id, selected]]), getData: () => liveData,
+    selectOnly: node => { focused = node; }, importData: data => { liveData = data; }, requestSave: () => { saves++; },
+  }));
+  app.vault.getFileByPath = name => name === file.path ? file : null;
+  const view = createView();
+  t.after(() => view.onClose());
+  await view.onOpen();
+  assert.equal(view.executor, "local-api");
+  assert.deepEqual(Array.from(view.executorButtons, ([id]) => id), ["local-api"]);
+  assert.equal(view.indicator.dataset.ready, "true");
+  assert.equal(view.modelSelect.value, "two");
+  assert.equal(view.feedback.textContent, "");
+  assert.equal(await view.captureSelection(), true);
+  assert.equal(view.effortWrap.hidden, true);
+  assert.equal(view.repoRow.hidden, true);
+  assert.deepEqual(Array.from(view.modeButtons, ([id]) => id), ["edit_canvas"]);
+  view.input.value = "Make the selected note clearer";
+  view.input.oninput();
+  await view.send();
+  assert.equal(view.input.value, "");
+  assert.equal(view.list.querySelector(".bc-task").dataset.status, "running");
+  assert.equal(requests[0].throw, false);
+  const body = JSON.parse(requests[0].body);
+  assert.equal(body.model, "two");
+  const parsed = canvasContext.parseCanvasPromptEnvelope(body.messages[0].content);
+  assert.equal(parsed.instruction, "Make the selected note clearer");
+  assert.deepEqual(parsed.metadata.selectedIds, ["chosen"]);
+  assert.equal(parsed.metadata.targetWorkspace, "");
+  assert.match(body.messages[0].content, /执行者 Local API/);
+  const reply = '# Updated note\n\n```canvas-patch\n{"updateNodes":[{"id":"chosen","text":"After"},{"id":"outside","text":"Overwrite"}]}\n```';
+  resolveRequest({ status: 200, json: { choices: [{ message: { content: reply } }] } });
+  await new Promise(resolve => setImmediate(resolve));
+  await view.refresh();
+  assert.equal(view.list.querySelector(".bc-task").dataset.status, "replied");
+  assert.equal(view.list.querySelector(".bc-meta").querySelector(".bc-badge").textContent, "Local API");
+  assert.match(view.list.querySelector(".bc-answer").querySelector("h1").textContent, /Updated note/);
+  assert.equal(view.list.querySelector(".bc-card-grid").querySelectorAll(".bc-mini-card").length, 1);
+  assert.ok(view.list.querySelector(".bc-patch-cards").querySelector(".bc-mini-card"));
+  view.list.querySelector(".bc-card-focus").onclick();
+  assert.equal(focused, selected);
+  const patchButton = () => view.list.querySelector(".bc-patch-buttons").querySelector("button");
+  await patchButton().onclick();
+  assert.deepEqual(Array.from(liveData.nodes, node => node.text), ["After", "Outside"]);
+  const task = plugin.localTaskStore.list(app.vault.adapter.getBasePath())[0];
+  const key = `local-api:${task.id}`;
+  assert.ok(saved.get("obsidian-canvas-bridge:applied")[key]);
+  assert.equal(patchButton().textContent, "撤销应用");
+  await patchButton().onclick();
+  assert.deepEqual(Array.from(liveData.nodes, node => node.text), ["Before", "Outside"]);
+  assert.equal(Object.hasOwn(plugin.appliedPatches, key), false);
+  assert.equal(saves, 2);
+});
+
+test("shows setup guidance for a missing Bridge entry and supports custom providers through the extension API", async t => {
+  const { plugin, createView } = setup({ realModules: true, bridgeConfig: { mcpServers: {} } });
+  const view = createView();
+  t.after(() => view.onClose());
+  await view.onOpen();
+  assert.match(view.feedback.textContent, /设置 → Canvas Bridge/);
+  assert.equal(view.executorButtons.length, 0);
+  assert.equal(view.submit.disabled, true);
+
+  const tasks = [];
+  let stopped = 0;
+  let change;
+  let request;
+  const custom = {
+    id: "reviewer", label: "Review Provider", kind: "custom",
+    capabilities: { modes: ["execute_task"], supportsRepo: true, supportsEffort: true },
+    getStatus: async () => ({ available: true, models: ["model-a"], efforts: ["low", "high"] }),
+    listTasks: () => tasks,
+    subscribe: (_workspace, notify) => { change = notify; return () => { stopped++; }; },
+    dispatch: input => {
+      request = input;
+      tasks.push({ id: "result", status: "running", prompt: input.prompt, time: new Date().toISOString() });
+      return { ok: true, id: "result" };
+    },
+  };
+  assert.equal(plugin.registerProvider(custom), custom);
+  await view.refresh();
+  assert.deepEqual(Array.from(view.executorButtons, ([id]) => id), ["reviewer"]);
+  assert.equal(view.executor, "reviewer");
+  assert.equal(view.effortWrap.hidden, false);
+  view.effortSelect.value = "high";
+  view.onEffortChange();
+  view.input.value = "Review this";
+  view.input.oninput();
+  await view.send();
+  assert.equal(request.prompt, "Review this");
+  assert.equal(request.mode, "execute_task");
+  assert.equal(request.model, "model-a");
+  assert.equal(request.effort, "high");
+  assert.equal(request.workspace, view.workspacePath);
+  assert.ok(request.token);
+  tasks[0] = { ...tasks[0], status: "replied", reply: "Looks good", providerLabel: "Review Worker" };
+  change();
+  await view.refresh();
+  assert.equal(view.list.querySelector(".bc-meta").querySelector(".bc-badge").textContent, "Review Worker");
+  assert.equal(view.list.querySelector(".bc-answer").textContent, "Looks good");
+  await plugin.updateSettings({ enableBridge: false, openaiProviders: [] });
+  assert.equal(plugin.getProviders().includes(custom), true);
+  assert.equal(plugin.providerLabel("reviewer"), "Review Provider");
+  assert.equal(plugin.unregisterProvider("reviewer"), true);
+  await view.refresh();
+  assert.equal(stopped, 1);
+  assert.match(view.feedback.textContent, /设置 → Canvas Bridge/);
+});
+
+test("settings tab edits profiles, tests the current endpoint, and refreshes an open sidebar", async t => {
+  class PluginSettingTab { constructor() { this.containerEl = new FakeElement(); } }
+  class Setting {
+    constructor(parent) {
+      this.el = parent.createDiv({ cls: "setting-item" });
+      this.el.setting = this;
+    }
+    setName(name) { this.name = name; return this; }
+    setDesc(desc) { this.desc = desc; return this; }
+    setHeading() { return this; }
+    addControl(build) {
+      this.control = {
+        inputEl: new FakeElement("input"),
+        setValue(value) { this.value = value; return this; },
+        setButtonText(value) { this.text = value; return this; },
+        onChange(change) { this.change = change; return this; },
+        onClick(click) { this.click = click; return this; },
+      };
+      build(this.control);
+      return this;
+    }
+    addText(build) { return this.addControl(build); }
+    addTextArea(build) { return this.addControl(build); }
+    addToggle(build) { return this.addControl(build); }
+    addButton(build) { return this.addControl(build); }
+  }
+  const requests = [];
+  const { plugin, createView, notices, writes, saved } = setup({
+    realModules: true, obsidian: { PluginSettingTab, Setting },
+    requestUrl: options => { requests.push(options); return { status: 200, json: { data: [] } }; },
+  });
+  const view = createView();
+  t.after(() => view.onClose());
+  await view.onOpen();
+  const tab = plugin.registeredSettingsTab;
+  tab.display();
+  const cardAt = index => tab.containerEl.querySelectorAll(".bc-settings-card")[index];
+  const setting = (name, container = tab.containerEl) => container.querySelectorAll(".setting-item")
+    .map(item => item.setting).find(item => item.name === name);
+  assert.match(setting("启用本机桥接").desc, /未检测到/);
+  await setting("OpenAI 兼容服务").control.click();
+  assert.equal(tab.containerEl.querySelectorAll(".bc-settings-card").length, 2);
+  const newCard = cardAt(1);
+  assert.equal(setting("API Key", newCard).control.inputEl.type, "password");
+  await Promise.all([
+    setting("名称", newCard).control.change("Example Endpoint"),
+    setting("Base URL", newCard).control.change("https://api.example.test/v1/chat/completions/"),
+    setting("API Key", newCard).control.change("example-test-key"),
+    setting("模型", newCard).control.change("demo-a,demo-b\ndemo-a"),
+    setting("系统提示词（可选）", newCard).control.change("Be concise."),
+    setting("启用服务", newCard).control.change(true),
+  ]);
+  await view.refresh();
+  const profile = writes.at(-1).openaiProviders[1];
+  assert.equal(profile.name, "Example Endpoint");
+  assert.equal(profile.apiKey, "example-test-key");
+  assert.equal(profile.systemPrompt, "Be concise.");
+  assert.deepEqual(profile.models, ["demo-a", "demo-b"]);
+  assert.equal(profile.defaultModel, "demo-a");
+  assert.equal(view.executor, profile.id);
+  assert.equal(view.modelSelect.value, "demo-a");
+  assert.equal(JSON.stringify(plugin.getProviders()).includes(profile.apiKey), false);
+  assert.equal(JSON.stringify(Array.from(saved)).includes(profile.apiKey), false);
+  const [check, remove] = newCard.querySelectorAll("button");
+  await check.onclick({ currentTarget: check });
+  assert.equal(requests[0].url, "https://api.example.test/v1/models");
+  assert.equal(requests[0].method, "GET");
+  assert.equal(requests[0].headers.Authorization, "Bearer example-test-key");
+  assert.match(notices.at(-1), /连接成功/);
+  await setting("启用本机桥接").control.change(false);
+  assert.equal(writes.at(-1).enableBridge, false);
+  assert.equal(setting("启用本机桥接").desc, "已停用");
+  await remove.onclick();
+  await view.refresh();
+  assert.equal(writes.at(-1).openaiProviders.length, 1);
+  assert.equal(tab.containerEl.querySelectorAll(".bc-settings-card").length, 1);
+  assert.equal(view.executorButtons.length, 0);
+});
+
+test("keeps detected Bridge adapters and the watcher working and merges provider history with a cap", async t => {
+  const calls = [];
+  let closed = 0;
+  const bridgeTasks = [{ id: "shared", executor: "codex", status: "replied", prompt: "Bridge task", time: "2026-06-03T00:00:00Z" }];
+  const { plugin, createView } = setup({
+    realModules: true,
+    bridgeConfig: { mcpServers: { "chatgpt-bridge": { command: path.resolve("python"), args: [path.resolve("bridge_server.py")] } } },
+    watch: () => ({ on() {}, close() { closed++; } }),
+    execFile: (_command, _args, _options, callback) => ({ stdin: {
+      on() {}, end(text) {
+        const payload = JSON.parse(text);
+        calls.push(payload);
+        const body = payload.action === "snapshot" ? { paired: true, project: "example", conversation: "chat", codex_ready: true, tasks: bridgeTasks } : {};
+        queueMicrotask(() => callback(null, JSON.stringify({ ok: true, ...body })));
+      },
+    } }),
+  });
+  await plugin.settingsReady;
+  plugin.registerProvider({
+    id: "reviewer", label: "Reviewer", kind: "custom", capabilities: { modes: ["execute_task"] },
+    getStatus: () => ({ ready: true }), dispatch: () => ({ ok: false }),
+    listTasks: () => [
+      { id: "shared", status: "replied", prompt: "External task", time: "2026-06-02T00:00:00Z" },
+      ...Array.from({ length: 30 }, (_, i) => ({ id: `task-${i}`, status: "blocked", prompt: "Old task", time: new Date(i * 1000).toISOString() })),
+    ],
+  });
+  const view = createView();
+  t.after(() => view.onClose());
+  await view.onOpen();
+  assert.deepEqual(Array.from(view.executorButtons, ([id]) => id), ["agy", "codex", "reviewer"]);
+  assert.equal(view.executor, "agy");
+  assert.equal(view.count.textContent, "30");
+  assert.deepEqual(Array.from(view.tasks.slice(0, 2), task => task.prompt), ["Bridge task", "External task"]);
+  assert.deepEqual(view.list.querySelectorAll(".bc-task").slice(0, 2).map(el => el.dataset.taskKey), ["codex:shared", "reviewer:shared"]);
+  view.setExecutor("codex");
+  view.input.value = "Bridge request";
+  view.input.oninput();
+  await view.send();
+  const sent = calls.find(call => call.action === "dispatch_codex");
+  assert.equal(sent.text, "Bridge request");
+  assert.equal(sent.mode, "execute_task");
+  assert.ok(sent.token);
+  await plugin.updateSettings({ enableBridge: false });
+  await view.refresh();
+  assert.equal(closed, 1);
+  assert.equal(view.executor, "reviewer");
+  assert.deepEqual(Array.from(view.executorButtons, ([id]) => id), ["reviewer"]);
+});
+
+test("uses global fetch when Obsidian requestUrl is unavailable", async () => {
+  const requests = [];
+  const { plugin } = setup({
+    realModules: true,
+    settings: { enableBridge: false, openaiProviders: [{ id: "sample-api", enabled: true, baseUrl: "http://localhost:12345/v1" }] },
+    fetch: async (url, options) => {
+      requests.push({ url, options });
+      return new Response(JSON.stringify({ choices: [{ message: { content: "Hello from fetch" } }] }));
+    },
+  });
+  await plugin.settingsReady;
+  const task = await plugin.providers.get("sample-api").dispatch({ workspace: "example", prompt: "Hello" }).settled;
+  assert.equal(task.reply, "Hello from fetch");
+  assert.equal(requests[0].url, "http://localhost:12345/v1/chat/completions");
+  assert.equal(Object.hasOwn(requests[0].options.headers, "Authorization"), false);
 });
