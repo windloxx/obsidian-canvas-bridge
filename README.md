@@ -2,6 +2,20 @@
 
 Obsidian desktop sidebar plugin that captures Canvas selections, linked note excerpts, and upstream/downstream edges, dispatches tasks to Antigravity or headless Codex via `Codex-Antigravity-Bridge`, renders rich Markdown replies and Canvas card previews, and applies/reverts `canvas-patch` edits directly in Obsidian.
 
+![Canvas Bridge Workspace](docs/images/hero-canvas-workflow.png)
+
+## Features
+
+- **Canvas Selection Auto-Capture & One-Click Locate**: Automatically tracks active Canvas selections (recursively expanding selected groups), resolves relative Markdown note excerpts, detects `repo:` paths, and lets you click **定位** on any card to select and zoom to the node without mutating the Canvas.
+
+![Selection Cards and Locate](docs/images/selection-and-locate.png)
+
+- **Native Markdown Replies, Visual Patch Cards & Safe Undo**: Renders replies with Obsidian's native `MarkdownRenderer`, turns `canvas-patch` blocks into color-coded node/edge diff cards, protects nodes outside the selection whitelist, avoids collisions for newly added cards, and applies/reverts edits via `importData + pushHistory` (or `vault.process` when closed).
+
+![Patch Preview and Safe Apply](docs/images/patch-preview-and-apply.png)
+
+- **Dual Executor & Model Picker**: Switch between Antigravity and Codex in the sidebar, dynamically pick models and reasoning efforts, and keep raw prompt/patch JSON collapsed unless needed.
+
 ## Prerequisites
 
 - Obsidian Desktop `>= 1.13.0`
