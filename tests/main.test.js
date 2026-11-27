@@ -5,7 +5,25 @@ const path = require("node:path");
 const vm = require("node:vm");
 
 const canvasContext = require("../canvas_context.js");
+const kanbanContext = require("../kanban_context.js");
 const main = fs.readFileSync(path.join(__dirname, "..", "main.js"), "utf8");
+
+function testFrontMatterInfo(text) {
+  const match = /^(---\r?\n)((?:[^\n]*\n)*?)---(?:\r?\n|$)/.exec(text);
+  return match ? { exists: true, frontmatter: match[2], from: match[1].length, to: match[1].length + match[2].length, contentStart: match[0].length }
+    : { exists: false, frontmatter: "", from: 0, to: 0, contentStart: 0 };
+}
+
+function testParseYaml(text) {
+  return Object.fromEntries(text.trim().split(/\r?\n/).filter(Boolean).map(line => {
+    const boundary = line.indexOf(": ");
+    return [line.slice(0, boundary), JSON.parse(line.slice(boundary + 2))];
+  }));
+}
+
+function testStringifyYaml(fm) {
+  return Object.entries(fm).map(([name, value]) => `${name}: ${JSON.stringify(value)}\n`).join("");
+}
 
 class FakeElement {
   constructor(tag = "div", options = {}) {
@@ -16,7 +34,8 @@ class FakeElement {
     this.attributes = {};
     this.style = { setProperty: (name, value) => { this.style[name] = value; } };
     const classes = new Set((options.cls || "").split(/\s+/).filter(Boolean));
-    this.classList = { add: name => classes.add(name), remove: name => classes.delete(name), contains: name => classes.has(name) };
+    this.classList = { add: name => classes.add(name), remove: name => classes.delete(name), contains: name => classes.has(name),
+      toggle: (name, enabled) => enabled ? classes.add(name) : classes.delete(name) };
     this.textContent = options.text || "";
     this.open = false;
     this.listeners = new Map();
@@ -31,8 +50,17 @@ class FakeElement {
   createEl(tag, options = {}) { return this.appendChild(new FakeElement(tag, options)); }
   createDiv(options = {}) { return this.createEl("div", options); }
   createSpan(options = {}) { return this.createEl("span", options); }
-  empty() { this.children = []; this.textContent = ""; }
+  empty() { for (const child of [...this.children]) child.remove(); this.textContent = ""; }
+  remove() {
+    const parent = this.parentElement;
+    if (parent) parent.children = parent.children.filter(child => child !== this);
+    this.parentElement = null;
+  }
+  contains(element) { return this === element || this.children.some(child => child.contains(element)); }
+  focus() { this.focused = true; }
+  scrollIntoView() { this.scrolled = true; }
   addEventListener(name, callback) { this.listeners.set(name, callback); }
+  removeEventListener(name) { this.listeners.delete(name); }
   matches(selector) {
     const [, tag, classes, open] = /^([\w-]*)([.\w-]*)(\[open\])?$/.exec(selector);
     return (!tag || this.tagName === tag.toUpperCase()) && (!open || this.open)
@@ -55,6 +83,7 @@ function setup(options = {}) {
   const events = new Map();
   const leaves = [];
   const commands = [];
+  const commandCallbacks = new Map();
   const saved = new Map();
   const notices = [];
   const writes = [];
@@ -66,6 +95,7 @@ function setup(options = {}) {
       on: (name, handler) => events.set(name, handler),
     },
     vault: {},
+    metadataCache: options.metadataCache,
     loadLocalStorage: key => saved.get(key),
     saveLocalStorage: (key, value) => saved.set(key, value),
   };
@@ -76,7 +106,7 @@ function setup(options = {}) {
     }
     registerView(type, create) { viewTypes.set(type, create); }
     addRibbonIcon() {}
-    addCommand(command) { commands.push(command.id); }
+    addCommand(command) { commands.push(command.id); commandCallbacks.set(command.id, command.callback); }
     registerEvent() {}
   }
   class ItemView {
@@ -88,7 +118,8 @@ function setup(options = {}) {
   }
   class Scope { register() {} }
   class Component { constructor() { this.unloaded = false; } unload() { this.unloaded = true; } }
-  const obsidian = { Plugin, ItemView, Scope, setIcon() {} };
+  const obsidian = { Plugin, ItemView, Scope, setIcon() {},
+    getFrontMatterInfo: testFrontMatterInfo, parseYaml: testParseYaml, stringifyYaml: testStringifyYaml };
   if (options.realModules) {
     app.vault.adapter = { getBasePath: () => path.dirname(pluginDir) };
     app.vault.getName = () => "Example Vault";
@@ -126,14 +157,14 @@ function setup(options = {}) {
     module,
     URL,
     fetch: options.fetch,
-    window: { setTimeout, clearTimeout, setInterval, clearInterval },
+    window: { setTimeout, clearTimeout, setInterval, clearInterval, ...options.timers },
     require: obsidianRequire,
   });
   const plugin = new module.exports();
-  if (!options.realModules) plugin.canvasContext = canvasContext;
+  if (!options.realModules) Object.assign(plugin, { canvasContext, kanbanContext });
   plugin.onload();
   return {
-    plugin, app, events, leaves, commands, saved, notices, writes, files, obsidianRequire,
+    plugin, app, events, leaves, commands, commandCallbacks, saved, notices, writes, files, obsidianRequire,
     createView: () => viewTypes.get("obsidian-canvas-bridge")({}),
   };
 }
@@ -144,6 +175,15 @@ function leaf(file, canvas, fallback) {
 
 function card(id, fields = {}) {
   return { id, type: "text", x: 0, y: 0, width: 100, height: 50, ...fields };
+}
+
+async function openRerunView(t, options) {
+  const env = setup({ realModules: true, ...options });
+  env.saved.set("obsidian-canvas-bridge:auto-capture", false);
+  const view = env.createView();
+  t.after(() => view.onClose());
+  await view.onOpen();
+  return { ...env, view };
 }
 
 test("renders Canvas selection and patch cards alongside native Markdown and collapsed raw data", async () => {
@@ -352,6 +392,275 @@ test("builds a Codex dispatch payload without an AGY pairing", () => {
   assert.equal(payload.canvas_path, "Board.canvas");
   assert.deepEqual(payload.selected_ids, ["a"]);
   assert.match(payload.text, /改写/);
+});
+
+test("renders rerun buttons only for blocked and notification_failed tasks", () => {
+  const { createView } = setup();
+  const view = createView();
+  view.list = new FakeElement();
+  view.count = new FakeElement();
+  view.route = { paired: true };
+  const task = status => ({ id: status, executor: "agy", status, prompt: `${status} task` });
+  view.showTasks([
+    task("blocked"), task("notification_failed"), task("replied"), task("running"),
+    { ...task("blocked"), id: "blank", prompt: " \n " },
+  ]);
+  assert.deepEqual(view.list.querySelectorAll(".bc-rerun").map(button => button.closest(".bc-task").dataset.request), [
+    "blocked", "notification_failed",
+  ]);
+});
+
+test("clicks a blocked Codex task's rerun button, preserving the task and composer while blocking duplicates", async t => {
+  const { view, plugin, saved } = await openRerunView(t);
+  view.route = {
+    codex_ready: true, codex_model: "provider/codex/current",
+    codex_models: [
+      { id: "provider/codex/current", efforts: ["low"] },
+      { id: "provider/codex/original", efforts: ["high"] },
+    ],
+  };
+  let refreshes = 0;
+  view.refresh = async () => { refreshes++; view.updateHistory(); };
+  view.input.value = "draft text";
+  view.input.oninput();
+  const draft = view.draft;
+  const context = { snapshot: canvasContext.extractSelectionSnapshot({ nodes: [card("live")] }, ["live"], "live.canvas") };
+  view.context = context;
+  const task = {
+    id: "blocked-codex", executor: "codex", status: "blocked", prompt: "原始 Codex 指令",
+    mode: "edit_canvas", targetWorkspace: "G:\\Repo", canvasPath: "Board.canvas", selectedIds: ["node"],
+    model: "provider/codex/original", effort: "high", stepGoal: "保留原步骤",
+    token: "74f241af-bfba-40d7-92e1-9786639af853",
+  };
+  let resolveDispatch;
+  const calls = [];
+  plugin.callBridge = (workspace, payload) => {
+    calls.push({ workspace, payload });
+    return new Promise(resolve => { resolveDispatch = resolve; });
+  };
+  view.route.tasks = [task];
+  view.updateHistory();
+  const rerunButton = () => view.list.querySelector(".bc-rerun");
+  assert.equal(rerunButton().getAttribute("type"), "button");
+  const click = rerunButton().onclick;
+  click();
+  assert.equal(rerunButton().disabled, true);
+  assert.equal(rerunButton().innerText, "重跑中…");
+  click();
+  rerunButton().onclick();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].workspace, view.workspacePath);
+  const { token, ...payload } = calls[0].payload;
+  assert.deepEqual(payload, {
+    action: "rerun_codex", job_id: task.id, model: task.model, effort: task.effort,
+  });
+  assert.match(token, /^[\da-f]{8}-[\da-f]{4}-4[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/);
+  assert.notEqual(token, task.token);
+  assert.notEqual(token, draft.token);
+  resolveDispatch({ ok: true });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(refreshes, 1);
+  assert.equal(rerunButton().disabled, false);
+  assert.equal(rerunButton().innerText, "重跑");
+  assert.equal(view.input.value, "draft text");
+  assert.equal(view.draft, draft);
+  assert.equal(draft.text, "draft text");
+  assert.equal(saved.get("obsidian-canvas-bridge:draft"), draft);
+  assert.equal(view.context, context);
+  assert.equal(context.snapshot.canvasPath, "live.canvas");
+  assert.deepEqual(context.snapshot.effectiveNodeIds, ["live"]);
+  rerunButton().onclick();
+  assert.equal(calls.length, 2);
+  assert.notEqual(calls[1].payload.token, token);
+  const cards = () => view.list.querySelectorAll(".bc-task").map(card => [card.dataset.request, card.dataset.status]);
+  view.route.tasks = [{ ...task, status: "running" }];
+  resolveDispatch({ ok: true, job_id: task.id });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(cards(), [[task.id, "running"]]);
+  view.route.tasks = [{ ...task, status: "replied", reply: "Codex 重跑成功" }];
+  await view.refresh();
+  assert.deepEqual(cards(), [[task.id, "replied"]]);
+  assert.equal(view.input.value, "draft text");
+  assert.equal(view.draft, draft);
+  assert.equal(view.context, context);
+});
+
+test("falls back to the current Codex model and effort when the original selection is unavailable", () => {
+  const { createView } = setup();
+  const view = createView();
+  view.workspacePath = "G:\\Vault";
+  view.route = {
+    codex_ready: true, codex_model: "provider/codex/current",
+    codex_models: [{ id: "provider/codex/current", efforts: ["low"] }],
+  };
+  view.modelPrefs = { agy: "", codex: "provider/codex/current", codexEffort: "low" };
+  const task = {
+    id: "archived-codex", executor: "codex", status: "blocked", prompt: "重跑",
+    model: "provider/codex/removed", effort: "high",
+  };
+  assert.deepEqual({ ...view.rerunPayload(task) }, {
+    action: "rerun_codex", job_id: task.id, model: "provider/codex/current", effort: "low",
+  });
+  view.route.codex_model = task.model;
+  assert.equal(view.rerunPayload(task).model, task.model);
+  view.route.codex_model = "";
+  view.route.codex_models = [];
+  assert.deepEqual({ ...view.rerunPayload(task) }, {
+    action: "rerun_codex", job_id: task.id, model: task.model, effort: task.effort,
+  });
+});
+
+test("reruns AGY and custom provider tasks and refreshes their task sources", async t => {
+  const { view, plugin } = await openRerunView(t);
+  let bridgeRefreshes = 0;
+  let providerRefreshes = 0;
+  view.refresh = async () => { bridgeRefreshes++; };
+  view.refreshProviders = async () => { providerRefreshes++; };
+  const agyCalls = [];
+  plugin.callBridge = async (_workspace, payload) => { agyCalls.push(payload); return { ok: true }; };
+  view.route = { paired: true, project: "project", conversation: "conversation" };
+  const agyTask = { id: "agy-blocked", status: "blocked", prompt: "AGY 重跑", model: "agy-original" };
+  view.showTasks([agyTask]);
+  await view.rerunTask(agyTask);
+  assert.equal(agyCalls.length, 1);
+  const { token: agyToken, ...agyPayload } = agyCalls[0];
+  assert.ok(agyToken);
+  assert.deepEqual(agyPayload, {
+    action: "send", project: "project", conversation: "conversation", text: agyTask.prompt,
+    replace_request_id: agyTask.id, model: agyTask.model,
+  });
+  assert.equal(bridgeRefreshes, 1);
+  assert.equal(providerRefreshes, 0);
+
+  const providerCalls = [];
+  let finish;
+  const settled = new Promise(resolve => { finish = resolve; });
+  const provider = {
+    id: "reviewer", label: "Reviewer", enabled: true,
+    getStatus: () => ({ ready: true }), listTasks: () => [],
+    dispatch: async payload => { providerCalls.push(payload); return { ok: true, settled }; },
+  };
+  plugin.registerProvider(provider);
+  providerRefreshes = 0;
+  view.providerStates.set(provider.id, { adapter: provider, value: { ready: true } });
+  const customTask = {
+    id: "provider-blocked", executor: provider.id, status: "blocked", prompt: "Provider 重跑",
+    mode: "execute_task", targetWorkspace: "G:\\Review", canvasPath: "Review.canvas", selectedIds: ["review"],
+    source: "Extension", model: "provider-original", effort: "high",
+  };
+  view.showTasks([customTask]);
+  await view.rerunTask(customTask);
+  assert.equal(providerCalls.length, 1);
+  const { token: providerToken, ...providerPayload } = providerCalls[0];
+  assert.ok(providerToken);
+  assert.deepEqual(providerPayload, {
+    workspace: view.workspacePath, targetWorkspace: customTask.targetWorkspace, executor: provider.id,
+    mode: customTask.mode, prompt: customTask.prompt, canvasPath: customTask.canvasPath, selectedIds: customTask.selectedIds,
+    source: customTask.source, rerunId: customTask.id, model: customTask.model, effort: customTask.effort,
+  });
+  assert.deepEqual([bridgeRefreshes, providerRefreshes], [1, 1]);
+  finish();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual([bridgeRefreshes, providerRefreshes], [1, 2]);
+});
+
+test("reruns a blocked OpenAI-compatible HTTP task and shows the new reply in history", async t => {
+  const requests = [];
+  let finish;
+  const { view, plugin } = await openRerunView(t, {
+    settings: { openaiProviders: [{ id: "local-api", enabled: true, models: "default,original", defaultModel: "default" }] },
+    requestUrl(request) {
+      requests.push(request);
+      if (requests.length === 1) return { status: 503, json: { error: { message: "暂时不可用" } } };
+      return new Promise(resolve => { finish = resolve; });
+    },
+  });
+  const adapter = plugin.providers.get("local-api");
+  const original = await adapter.dispatch({
+    workspace: view.workspacePath, prompt: "保留 HTTP 指令", model: "original",
+    canvasPath: "HTTP.canvas", selectedIds: ["http"], token: "original-token",
+  }).settled;
+  assert.equal(original.status, "blocked");
+  await view.refreshProviders();
+  const cards = () => view.list.querySelectorAll(".bc-task").map(task => [task.dataset.request, task.dataset.status]);
+  assert.deepEqual(cards(), [[original.id, "blocked"]]);
+  view.list.querySelector(".bc-rerun").onclick();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(cards(), [[original.id, "running"]]);
+  assert.equal(requests.length, 2);
+  const request = JSON.parse(requests[1].body);
+  assert.equal(request.model, original.model);
+  assert.deepEqual(request.messages.at(-1), { role: "user", content: original.prompt });
+  finish({ status: 200, json: { choices: [{ message: { content: "重跑成功" } }] } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(cards(), [[original.id, "replied"]]);
+  assert.equal(view.list.querySelector(".bc-answer").innerText, "重跑成功");
+  const tasks = plugin.localTaskStore.list(view.workspacePath);
+  assert.equal(tasks.length, 1);
+  const [retried] = tasks;
+  assert.equal(retried.id, original.id);
+  assert.equal(retried.time, original.time);
+  assert.equal(retried.canvasPath, original.canvasPath);
+  assert.deepEqual(Array.from(retried.selectedIds), ["http"]);
+});
+
+test("re-enables rerun on updateHistory when routes or the current provider become ready", async t => {
+  const { view, plugin, notices } = await openRerunView(t, { render() {} });
+  const agyTask = { id: "not-paired", executor: "agy", status: "blocked", prompt: "等待配对" };
+  const codexTask = { id: "codex-wait", executor: "codex", status: "notification_failed", prompt: "等待 Codex" };
+  const provider = {
+    id: "reviewer", label: "Reviewer", enabled: true, getStatus: () => ({ ready: true }), listTasks: () => [],
+    dispatch: () => assert.fail("An unavailable provider must not receive a rerun"),
+  };
+  plugin.registerProvider(provider);
+  const providerTask = { id: "not-ready", executor: provider.id, providerLabel: provider.label, status: "blocked", prompt: "等待服务" };
+  view.route = { paired: false, reason: "需要先配对", codex_error: "缺少 Codex 配置", tasks: [agyTask, codexTask] };
+  view.providerTasks = [providerTask];
+  view.providerStates.set(provider.id, { adapter: provider, value: { ready: false, message: "服务未就绪" } });
+  const buttons = () => view.list.querySelectorAll(".bc-rerun");
+  view.updateHistory();
+  assert.deepEqual(buttons().map(button => [button.disabled, button.title]), [
+    [true, "需要先配对"], [true, "缺少 Codex 配置"], [true, "服务未就绪"],
+  ]);
+  await view.rerunTask(providerTask);
+  assert.equal(view.feedback.innerText, "服务未就绪");
+  assert.equal(notices.at(-1), "服务未就绪");
+
+  view.route = { ...view.route, paired: true, codex_ready: true };
+  view.providerStates.set(provider.id, { adapter: { ...provider }, value: { ready: true } });
+  view.updateHistory();
+  assert.deepEqual(buttons().map(button => button.disabled), [false, false, true]);
+  assert.equal(buttons().at(-1).title, "Reviewer 未就绪");
+  view.providerStates.set(provider.id, { adapter: provider, value: { ready: true } });
+  view.updateHistory();
+  assert.deepEqual(buttons().map(button => button.disabled), [false, false, false]);
+  const component = view.renderComponent;
+  const readyButtons = buttons();
+  view.updateHistory();
+  assert.equal(view.renderComponent, component);
+  assert.deepEqual(buttons(), readyButtons);
+});
+
+test("reports rejected reruns and restores the action when history is unchanged", async t => {
+  const { view, plugin, notices } = await openRerunView(t);
+  const task = { id: "rejected", executor: "codex", status: "blocked", prompt: "重试" };
+  view.route = { codex_ready: true, tasks: [task] };
+  view.refresh = async () => view.updateHistory();
+  plugin.callBridge = async () => ({ ok: false, error: "请求被拒绝" });
+  view.updateHistory();
+  await view.rerunTask(task);
+  assert.equal(view.feedback.innerText, "请求被拒绝");
+  assert.equal(notices.at(-1), "重跑失败 · 请求被拒绝");
+  assert.equal(view.list.querySelector(".bc-rerun").disabled, false);
+
+  let reject;
+  const settled = new Promise((_, rejectPromise) => { reject = rejectPromise; });
+  plugin.callBridge = async () => ({ ok: true, settled });
+  await view.rerunTask(task);
+  reject(new Error("后续执行失败"));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(view.feedback.innerText, "后续执行失败");
+  assert.equal(view.list.querySelector(".bc-rerun").disabled, false);
 });
 
 test("passes the Canvas and IDs from both native context-menu events", () => {
@@ -633,15 +942,278 @@ test("defaults to edit_canvas mode, applies/reverts safely via importData + push
   assert.deepEqual([JSON.parse(disk).nodes[0].x, JSON.parse(disk).nodes[0].text], [0, "before"]);
 });
 
-test("loads both standalone modules under a restricted Obsidian require", async () => {
+test("loads the standalone modules under a restricted Obsidian require", async () => {
   const { plugin, files, obsidianRequire } = setup({ realModules: true });
   await plugin.settingsReady;
   assert.equal(obsidianRequire.cache, undefined);
   assert.throws(() => obsidianRequire("./providers.js"), /cannot resolve/);
-  assert.deepEqual(files, ["canvas_context.js", "providers.js"]);
+  assert.deepEqual(files, ["canvas_context.js", "kanban_context.js", "providers.js"]);
   assert.equal(typeof plugin.canvasContext.applyCanvasPatch, "function");
+  assert.equal(typeof plugin.kanbanContext.applyKanbanBodyEdits, "function");
   assert.equal(typeof plugin.providerModule.normalizeChatCompletionsUrl, "function");
   assert.deepEqual(Array.from(plugin.getProviders(), item => item.id), ["openai-compatible"]);
+});
+
+function kanbanFixture(env) {
+  const { app, leaves } = env;
+  const options = ["待办", "进行中", "等待对接", "已完成"];
+  const files = ["A", "B", "C"].map(basename => ({ path: `Tasks/${basename}.md`, basename, extension: "md" }));
+  const [a, b, c] = files;
+  const frontmatter = new Map([
+    [a, { 状态: "待办", updated: "2000-01-01", week: "本周", repo: "/workspace/a" }],
+    [b, { 状态: "已完成", week: "本周" }], [c, { 状态: "待办", week: "本周" }],
+  ]);
+  const serialize = fm => `---\n${testStringifyYaml(fm)}---\n`;
+  const raw = new Map(files.map(file => [file, serialize(frontmatter.get(file)) + "- [ ] 验证结果\n## 实时进展与记录\n关联：[[项目]]\n"]));
+  const writes = [];
+  app.metadataCache ||= {};
+  app.metadataCache.getFileCache = file => ({ frontmatter: frontmatter.get(file) });
+  Object.assign(app.vault, {
+    getFileByPath: value => files.find(file => file.path === value),
+    cachedRead: async file => raw.get(file), read: async file => raw.get(file),
+    process: async (file, edit) => {
+      const next = edit(raw.get(file));
+      raw.set(file, next);
+      frontmatter.set(file, testParseYaml(testFrontMatterInfo(next).frontmatter));
+    },
+  });
+  app.fileManager = { processFrontMatter: async (file, edit) => {
+    const fm = frontmatter.get(file);
+    const body = raw.get(file).slice(serialize(fm).length);
+    edit(fm);
+    raw.set(file, serialize(fm) + body);
+    writes.push(file.path);
+  } };
+  const containerEl = new FakeElement();
+  const subView = {
+    type: "kanban", containerEl, orderedGroups: [{ key: { data: "本周" } }],
+    columns: [], config: { get: key => key === "groupBy" ? { property: "note.week" } : undefined },
+  };
+  const board = { view: { getViewType: () => "bases", controller: {
+    view: subView, viewName: "按周", query: { views: [
+      { type: "table", groupBy: { property: "note.status" } },
+      { type: "kanban", groupBy: { property: "note.状态" }, groupOrder: options },
+    ] },
+  } }, getViewState: () => ({ state: { file: "Boards/Tasks.base" } }) };
+  const columnEl = containerEl.createDiv();
+  const items = [a, b].map(file => ({ entry: { file }, el: columnEl.createDiv({ cls: "bases-kanban-card" }) }));
+  subView.columns = new Set([{ group: { key: { data: "本周" }, entries: files.map(file => ({ file })) }, items, containerEl: columnEl }]);
+  app.workspace.activeLeaf = board;
+  leaves.push(board);
+  return { board, subView, containerEl, columnEl, items, files, a, b, c, options, frontmatter, raw, statusWrites: writes };
+}
+
+test("reinstalls Kanban overlays across virtual renders and keeps click, drag, and recycled card bindings scoped", async t => {
+  let metadataChanged;
+  let nextTimer = 0;
+  const timers = new Map();
+  const env = setup({ realModules: true, metadataCache: { on: (_event, handler) => { metadataChanged = handler; } }, timers: {
+    setTimeout: handler => { timers.set(++nextTimer, handler); return nextTimer; },
+    clearTimeout: id => timers.delete(id),
+  } });
+  const { plugin, events, commandCallbacks } = env;
+  await plugin.settingsReady;
+  t.after(() => plugin.onunload());
+  const { board, subView, containerEl, items, a, b, c } = kanbanFixture(env);
+  const observed = [];
+  containerEl.ownerDocument = { defaultView: { MutationObserver: class {
+    constructor(callback) { this.trigger = callback; observed.push(this); }
+    observe(target, options) { Object.assign(this, { target, options }); }
+    disconnect() { this.closed = true; }
+  } } };
+  const captures = [];
+  plugin.captureKanbanCardInPanel = hint => captures.push(hint);
+  const flush = () => { for (const [id, callback] of [...timers]) { timers.delete(id); callback(); } };
+  events.get("active-leaf-change")(board);
+  events.get("layout-change")();
+  assert.equal(timers.size, 1);
+  flush();
+  assert.equal(plugin.lastBasesLeaf, board);
+  assert.equal(observed[0].target, containerEl);
+  assert.equal(observed[0].options.subtree, true);
+  const el = items[0].el;
+  const overlay = el.querySelector(".bc-kanban-overlay");
+  plugin.syncKanbanBoards();
+  assert.equal(el.querySelector(".bc-kanban-overlay"), overlay);
+  assert.equal(el.dataset.bcFile, a.path);
+  assert.equal(overlay.querySelector(".bc-kanban-status-chip").textContent, "待办");
+  const button = overlay.querySelector(".bc-kanban-dispatch-btn");
+  let stopped = 0;
+  let prevented = 0;
+  const event = { target: button, stopPropagation: () => { stopped++; }, preventDefault: () => { prevented++; } };
+  button.listeners.get("pointerdown")(event);
+  button.listeners.get("mousedown")(event);
+  button.onclick(event);
+  containerEl.listeners.get("click")({ ...event, target: items[1].el, altKey: true, shiftKey: true });
+  assert.equal(stopped, 4);
+  assert.equal(prevented, 3);
+  assert.deepEqual(captures.map(hint => [hint.file.path, Boolean(hint.additive)]), [[a.path, false], [b.path, true]]);
+  el.empty();
+  items[0].entry.file = c;
+  observed[0].trigger();
+  metadataChanged();
+  assert.equal(timers.size, 1);
+  flush();
+  assert.equal(el.dataset.bcFile, c.path);
+  assert.equal(el.querySelectorAll(".bc-kanban-overlay").length, 1);
+  assert.notEqual(el.querySelector(".bc-kanban-overlay"), overlay);
+  el.querySelector(".bc-kanban-dispatch-btn").onclick(event);
+  assert.equal(captures.at(-1).file, c);
+  assert.ok(commandCallbacks.has("capture-kanban-card"));
+  subView.type = "table";
+  events.get("layout-change")();
+  flush();
+  assert.equal(el.querySelector(".bc-kanban-overlay"), null);
+  assert.equal(observed[0].closed, true);
+  assert.equal(containerEl.listeners.size, 0);
+});
+
+test("captures, locates, and manually updates Kanban cards using a sibling status view", async t => {
+  const env = await openRerunView(t, { settings: { openaiProviders: [{ id: "local-api", enabled: true }] } });
+  const { plugin, view, app, events, commandCallbacks } = env;
+  t.after(() => plugin.onunload());
+  const { board, subView, items, a, b, c, options, frontmatter } = kanbanFixture(env);
+  plugin.openPanel = async () => view;
+  events.get("active-leaf-change")(board);
+  const capture = await plugin.captureKanbanCardInPanel({ leaf: board, file: a, column: "本周" });
+  assert.equal(capture.snapshot.boardPath, "Boards/Tasks.base");
+  assert.equal(capture.snapshot.viewName, "按周");
+  assert.equal(capture.snapshot.groupBy, "week");
+  assert.deepEqual(Array.from(capture.snapshot.groupOrder), ["本周"]);
+  assert.equal(capture.snapshot.statusProperty, "状态");
+  assert.deepEqual(Array.from(capture.snapshot.statusOptions), options);
+  assert.equal(view.mode, "execute_task");
+  assert.equal(view.repo.value, "/workspace/a");
+  assert.equal(view.kanbanBar.hidden, false);
+  assert.equal(view.kanbanStatusSelect.options.length, options.length + 1);
+  assert.match(view.modeGroup.innerText, /改卡片\/状态/);
+  await plugin.captureKanbanCardInPanel({ leaf: board, file: b, column: "本周", additive: true });
+  plugin.syncKanbanBoards();
+  assert.ok(items.every(({ el }) => el.classList.contains("bc-kanban-selected")));
+  view.kanbanStatusSelect.value = "等待对接";
+  await view.kanbanStatusSelect.onchange();
+  assert.equal(frontmatter.get(a).状态, "等待对接");
+  assert.equal(frontmatter.get(a).updated, kanbanContext.todayLocalYmd());
+  assert.equal(frontmatter.get(b).状态, "等待对接");
+  assert.equal(Object.hasOwn(frontmatter.get(b), "updated"), false);
+  assert.equal(frontmatter.get(c).状态, "待办");
+  let revealed;
+  app.workspace.revealLeaf = async leaf => { revealed = leaf; };
+  assert.equal(await plugin.focusKanbanCard("Boards/Tasks.base", b.path), true);
+  assert.equal(revealed, board);
+  assert.equal(items[1].el.focused, true);
+  const [col] = subView.columns;
+  col.contentEl = { scrollTop: 0 };
+  subView.measurements = { cardHeight: 100, cardGap: 10 };
+  col.updateVirtualDisplay = () => {
+    assert.equal(col.contentEl.scrollTop, 220);
+    col.items.push({ entry: { file: c }, el: col.containerEl.createDiv({ cls: "bases-kanban-card" }) });
+  };
+  assert.equal(await plugin.focusKanbanCard("Boards/Tasks.base", c.path), true);
+  assert.equal(col.items.at(-1).el.scrolled, true);
+  const menu = { entries: [], addItem(add) {
+    const item = { setTitle(title) { this.title = title; return this; }, setIcon() { return this; }, onClick(fn) { this.click = fn; } };
+    add(item); this.entries.push(item);
+  } };
+  plugin.settings.enableBridge = true;
+  events.get("file-menu")(menu, c);
+  assert.deepEqual(menu.entries.map(item => item.title), ["抓取卡片到协作对话", "用 Codex 派活", "用 AGY 派活"]);
+  await menu.entries[0].click();
+  assert.equal(view.context.snapshot.cards[0].path, c.path);
+  plugin.syncKanbanBoards();
+  subView.containerEl.listeners.get("pointerover")({ target: items[0].el });
+  await commandCallbacks.get("capture-kanban-card")();
+  assert.equal(view.context.snapshot.cards[0].path, a.path);
+  view.autoCapture = true;
+  await view.syncAutoSelection();
+  assert.equal(view.context.kind, "kanban");
+});
+
+test("dispatches Kanban cards via Codex and AGY and advances only live initial statuses after acceptance", async t => {
+  const env = await openRerunView(t);
+  const { plugin, view, saved } = env;
+  t.after(() => plugin.onunload());
+  const { board, a, b, frontmatter, statusWrites } = kanbanFixture(env);
+  plugin.openPanel = async () => view;
+  view.route = { paired: true, codex_ready: true, project: "p", conversation: "c" };
+  view.registration = null;
+  view.refresh = async () => {};
+  view.updateComposer();
+  view.setExecutor("codex");
+  await plugin.captureKanbanCardInPanel({ leaf: board, file: a });
+  await plugin.captureKanbanCardInPanel({ leaf: board, file: b, additive: true });
+  const calls = [];
+  plugin.callBridge = async (_workspace, payload) => { calls.push(payload); return { ok: calls.length > 1, error: "当前不可用" }; };
+  assert.equal(view.kanbanAutoToggle.checked, true);
+  view.kanbanAutoToggle.checked = false;
+  view.kanbanAutoToggle.onchange();
+  assert.equal(saved.get("obsidian-canvas-bridge:kanban-auto-status"), false);
+  view.kanbanAutoToggle.checked = true;
+  view.kanbanAutoToggle.onchange();
+  assert.equal(saved.get("obsidian-canvas-bridge:kanban-auto-status"), true);
+  await view.kanbanQuickSend.onclick();
+  assert.equal(frontmatter.get(a).状态, "待办");
+  assert.deepEqual(statusWrites, []);
+  await view.kanbanQuickSend.onclick();
+  const { metadata, instruction } = kanbanContext.parseKanbanPromptEnvelope(calls[1].text);
+  assert.equal(calls[1].action, "dispatch_codex");
+  assert.equal(calls[1].token, calls[0].token);
+  assert.equal(calls[1].board_path, "Boards/Tasks.base");
+  assert.deepEqual(Array.from(calls[1].card_paths), [a.path, b.path]);
+  assert.equal(metadata.targetWorkspace, "/workspace/a");
+  assert.match(instruction, /kanban-patch/);
+  assert.equal(frontmatter.get(a).状态, "进行中");
+  assert.equal(frontmatter.get(b).状态, "已完成");
+  view.setExecutor("agy");
+  const agy = view.dispatchPayload("检查结果");
+  assert.equal(agy.action, "send");
+  assert.equal(kanbanContext.parseKanbanPromptEnvelope(agy.text).metadata.executor, "agy");
+});
+
+test("previews and applies locked Kanban reply updates through HTTP history, then restores raw content", async t => {
+  const reply = '已核对结果。\n\n```kanban-patch\n{"updates":[{"file":"Tasks/A.md","status":"已完成","properties":{"priority":2},"appendProgress":"完成回归","checkTasks":["验证结果"]},{"file":"Tasks/B.md","status":"待办"}]}\n```';
+  const env = await openRerunView(t, {
+    settings: { enableBridge: false, openaiProviders: [{ id: "openai-compatible", name: "API", enabled: true, baseUrl: "https://example.test/v1", models: ["test-model"] }] },
+    requestUrl: async () => ({ status: 200, json: { choices: [{ message: { content: reply } }] } }),
+  });
+  const { plugin, view, app } = env;
+  t.after(() => plugin.onunload());
+  const { board, a, b, raw, frontmatter } = kanbanFixture(env);
+  plugin.openPanel = async () => view;
+  await plugin.captureKanbanCardInPanel({ leaf: board, file: a });
+  const outside = raw.get(b);
+  await view.kanbanQuickSend.onclick();
+  assert.equal(frontmatter.get(a).状态, "进行中");
+  const before = raw.get(a);
+  await view.refreshProviders();
+  assert.equal(view.tasks[0].status, "replied");
+  assert.match(view.list.querySelector(".bc-task-canvas").textContent, /看板 · Tasks/);
+  assert.equal(view.list.querySelector(".bc-answer").textContent, "已核对结果。");
+  assert.equal(view.list.querySelector(".bc-patch-cards").children.length, 1);
+  assert.match(view.list.querySelector(".bc-patch-cards").innerText, /完成回归/);
+  assert.match(view.list.querySelector(".bc-patch").innerText, /更新 1 · 跳过 1/);
+  assert.equal(view.list.querySelectorAll(".bc-kanban-quick-status").length, 4);
+  const locate = view.list.querySelector(".bc-card-focus");
+  app.workspace.revealLeaf = async leaf => assert.equal(leaf, board);
+  assert.equal(await locate.onclick(), true);
+  const patchButton = () => view.list.querySelector(".bc-patch-buttons").querySelector("button");
+  assert.equal(patchButton().textContent, "应用到看板");
+  await patchButton().onclick();
+  assert.equal(frontmatter.get(a).状态, "已完成");
+  assert.match(raw.get(a), /priority: 2/);
+  assert.match(raw.get(a), /- \[x\] 验证结果/);
+  assert.match(raw.get(a), /- 完成回归\n关联：/);
+  assert.equal(raw.get(b), outside);
+  assert.equal(patchButton().textContent, "撤销应用");
+  const applied = raw.get(a);
+  raw.set(a, applied + "后续人工修改\n");
+  await patchButton().onclick();
+  assert.match(raw.get(a), /后续人工修改/);
+  assert.equal(patchButton().textContent, "撤销应用");
+  raw.set(a, applied);
+  await patchButton().onclick();
+  assert.equal(raw.get(a), before);
+  assert.equal(patchButton().textContent, "应用到看板");
 });
 
 test("queues an HTTP Canvas task with no Bridge configuration, renders the reply, and applies and reverts the patch", async t => {

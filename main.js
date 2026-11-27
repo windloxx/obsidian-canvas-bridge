@@ -1,5 +1,6 @@
 const {
-  Component, ItemView, MarkdownRenderer, Notice, Plugin, PluginSettingTab, Scope, Setting, requestUrl, setIcon,
+  Component, ItemView, MarkdownRenderer, Notice, Plugin, PluginSettingTab, Scope, Setting,
+  getFrontMatterInfo, parseYaml, requestUrl, setIcon, stringifyYaml,
 } = require("obsidian");
 const { execFile } = require("node:child_process");
 const crypto = require("node:crypto");
@@ -28,16 +29,19 @@ const VIEW = "obsidian-canvas-bridge";
 const DRAFT = `${VIEW}:draft`;
 const APPLIED = `${VIEW}:applied`;
 const AUTO_CAPTURE = `${VIEW}:auto-capture`;
+const KANBAN_AUTO_STATUS = `${VIEW}:kanban-auto-status`;
 const MODEL_PREFS = `${VIEW}:models`;
 const PROVIDER_TASKS = `${VIEW}:provider-tasks`;
 const EXECUTORS = { agy: "AGY", codex: "Codex" };
 const MODES = { edit_canvas: "改选区画布", execute_task: "执行任务" };
+const DEFAULT_KANBAN_INSTRUCTION = "请按上述看板任务卡的工作内容与验收标准推进，完成后在回复末尾附 kanban-patch 更新状态与进展。";
 const BRIDGE_CAPABILITIES = { modes: Object.keys(MODES), supportsRepo: true };
 const PROVIDER_GUIDANCE = "请在设置 → Canvas Bridge 启用 OpenAI 兼容服务，或安装并启用 Codex-Antigravity-Bridge。";
 const STATUS = {
   queued: "等待领取", notified: "已通知", claimed: "已领取", running: "执行中", replied: "已回复",
   blocked: "受阻", notification_failed: "通知失败", cancelled: "已取消",
 };
+const RERUNNABLE_STATUSES = new Set(["blocked", "notification_failed"]);
 const DECISION = {
   REWORK_REQUIRED: "需要返工", ESCALATE_TO_PRODUCER: "需要决定",
 };
@@ -48,6 +52,42 @@ const timeFormat = new Intl.DateTimeFormat("zh-CN", {
 function formatTime(value) {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "" : timeFormat.format(date);
+}
+
+function isKanbanContext(context) {
+  return context?.kind === "kanban";
+}
+
+function kanbanPathOf(card) {
+  return card?.entry?.file?.path || card?.file?.path || card?.path || "";
+}
+
+function groupKeyOf(group) {
+  if (group?.hasKey?.() === false) return "";
+  const key = group?.key ?? group;
+  return key?.data ?? key?.toString?.() ?? "";
+}
+
+function updateKanbanFrontmatter(text, updates, statusProperty, today) {
+  const info = getFrontMatterInfo(text);
+  const existing = info.exists ? parseYaml(info.frontmatter) : {};
+  if (existing != null && (typeof existing !== "object" || Array.isArray(existing))) {
+    throw new Error("卡片的 YAML 属性必须是键值映射。");
+  }
+  const frontmatter = { ...existing };
+  for (const update of updates) {
+    Object.assign(frontmatter, update.properties);
+    if (update.status) frontmatter[statusProperty] = update.status;
+  }
+  if (existing && Object.hasOwn(existing, "updated") && frontmatter[statusProperty] !== existing[statusProperty] && statusProperty !== "updated") {
+    frontmatter.updated = today;
+  }
+  const serialized = stringifyYaml(frontmatter);
+  if (existing && serialized === stringifyYaml(existing)) return text;
+  const newline = text.includes("\r\n") ? "\r\n" : "\n";
+  const yaml = serialized.replace(/\r?\n/g, newline);
+  if (info.exists) return text.slice(0, info.from) + yaml + text.slice(info.to);
+  return `---${newline}${yaml}---${newline}${text}`;
 }
 
 function iconButton(parent, icon, label) {
@@ -300,9 +340,30 @@ function addSelectionCard(view, grid, node, canvasPath) {
   }
 }
 
+function addKanbanCard(view, grid, card, boardPath) {
+  const { card: element, header } = addMiniCard(grid, { badge: "看板卡片" });
+  header.createSpan({ cls: "bc-card-title", text: card.title || path.basename(card.path || "") });
+  const locate = header.createEl("button", { cls: "bc-card-focus", text: "定位", attr: { type: "button" } });
+  locate.onclick = () => view.plugin.focusKanbanCard(boardPath, card.path);
+  const body = element.createDiv({ cls: "bc-card-body" });
+  body.createDiv({ cls: "bc-card-label", text: [card.column, card.status].filter(Boolean).join(" · ") });
+  if (card.excerpt) {
+    const excerpt = body.createEl("details", { cls: "bc-raw" });
+    excerpt.createEl("summary", { text: "查看卡片摘录" });
+    excerpt.createDiv({ text: card.excerpt.slice(0, 1000) });
+  }
+}
+
 function addTaskPrompt(view, body, prompt, parsed, canvasPath) {
   if (!parsed) {
     body.createDiv({ cls: "bc-prompt", text: prompt });
+    return;
+  }
+  if (parsed.metadata?.kind === "kanban") {
+    body.createDiv({ cls: "bc-user-instruction", text: parsed.instruction });
+    const grid = body.createDiv({ cls: "bc-card-grid bc-kanban-cards" });
+    for (const card of parsed.cards || []) addKanbanCard(view, grid, card, parsed.metadata.boardPath);
+    addRawDetails(body, "查看原始 Prompt", prompt);
     return;
   }
   body.createDiv({ cls: "bc-user-instruction", text: parsed.instruction });
@@ -327,6 +388,16 @@ function addPatchCard(view, cards, item, canvasPath) {
   const { card, header } = addMiniCard(cards, item);
   if (Object.hasOwn(CARD_TYPES, item.nodeType)) header.createSpan({ text: CARD_TYPES[item.nodeType] });
   const body = card.createDiv({ cls: "bc-card-body" });
+  if (item.kind === "kanbanUpdate") {
+    if (item.title) body.createDiv({ cls: "bc-card-title", text: item.title });
+    if (item.file) addNoteLink(view, body, item.file, "");
+    if (item.fromStatus !== item.toStatus) body.createDiv({ text: `${item.fromStatus || "—"} → ${item.toStatus || "—"}` });
+    for (const [name, value] of Object.entries(item.propertyChanges || {})) body.createDiv({ text: `${name} · ${JSON.stringify(value)}` });
+    if (item.appendProgress) body.createDiv({ text: item.appendProgress });
+    for (const text of item.checkTasks) body.createDiv({ text: `勾选 · ${text}` });
+    for (const text of item.uncheckTasks) body.createDiv({ text: `取消勾选 · ${text}` });
+    return;
+  }
   if (item.kind === "edge") {
     const from = [item.fromLabel, item.fromSide].filter(Boolean).join(" · ");
     const to = [item.toLabel, item.toSide].filter(Boolean).join(" · ");
@@ -343,6 +414,24 @@ function addPatchCard(view, cards, item, canvasPath) {
 }
 
 function addReplyContent(view, reply, task, parsed, canvasPath) {
+  if (parsed?.metadata?.kind === "kanban") {
+    const context = view.plugin.kanbanContext;
+    const { bodyMarkdown, patch, rawPatchJson } = context.splitReplyAndKanbanPatch(task.reply);
+    if (bodyMarkdown) void renderMarkdown(view, bodyMarkdown, reply.createDiv({ cls: "bc-answer markdown-rendered" }), parsed.metadata.boardPath);
+    if (patch) {
+      if (!isPatchError(patch)) {
+        const { cardPaths, statusOptions, statusProperty } = parsed.metadata;
+        const { operations } = context.validateKanbanPatch(patch, { allowedCardPaths: cardPaths || [], statusOptions, statusProperty });
+        const items = context.buildKanbanPatchPreviewItems({ updates: operations }, parsed.cards, statusProperty);
+        if (items.length) {
+          const cards = reply.createDiv({ cls: "bc-patch-cards" });
+          for (const item of items) addPatchCard(view, cards, item);
+        }
+      }
+      addRawDetails(reply, "查看 Patch JSON", rawPatchJson);
+    }
+    return patch;
+  }
   const context = view.plugin.canvasContext;
   const { bodyMarkdown, patch, rawPatchJson } = context?.splitReplyAndPatch(task.reply)
     ?? { bodyMarkdown: String(task.reply || "") };
@@ -363,8 +452,9 @@ function addReplyContent(view, reply, task, parsed, canvasPath) {
 }
 
 function addTask(view, task, open) {
-  const parsed = view.plugin.canvasContext?.parseCanvasPromptEnvelope(task.prompt);
-  const context = taskCanvas(task, parsed?.metadata);
+  const kanban = view.plugin.kanbanContext?.parseKanbanPromptEnvelope(task.prompt);
+  const parsed = kanban || view.plugin.canvasContext?.parseCanvasPromptEnvelope(task.prompt);
+  const context = kanban ? kanban.metadata : taskCanvas(task, parsed?.metadata);
   const canvasPath = context.canvasPath || (typeof parsed?.metadata.canvasPath === "string" ? parsed.metadata.canvasPath : "");
   const mode = context.mode || parsed?.metadata.mode;
   const executor = task.providerLabel || view.plugin.providerLabel(task.executor) || "AGY";
@@ -380,7 +470,11 @@ function addTask(view, task, open) {
   const sent = meta.createEl("time", { text: formatTime(task.time) });
   sent.title = task.time;
   meta.createSpan({ cls: "bc-status", text: STATUS[task.status] || task.status });
-  if (canvasPath) {
+  if (kanban) {
+    const boardPath = context.boardPath || "";
+    const tag = summary.createDiv({ cls: "bc-task-canvas", text: `看板 · ${path.basename(boardPath, ".base") || context.viewName || "Bases"}` });
+    tag.title = boardPath;
+  } else if (canvasPath) {
     const tag = summary.createDiv({ cls: "bc-task-canvas", text: `${MODES[mode] || "Canvas"} · ${path.basename(canvasPath)}` });
     tag.title = canvasPath;
   }
@@ -389,6 +483,7 @@ function addTask(view, task, open) {
   setIcon(preview.createSpan({ cls: "bc-chevron" }), "chevron-down");
   const body = details.createDiv({ cls: "bc-body" });
   addTaskPrompt(view, body, task.prompt, parsed, canvasPath);
+  if (kanban) view.addKanbanStatusActions(body, context);
   if (task.status === "replied") {
     const reply = body.createDiv({ cls: "bc-reply" });
     const heading = reply.createDiv({ cls: "bc-reply-heading" });
@@ -404,9 +499,20 @@ function addTask(view, task, open) {
       next.createEl("summary", { text: "后续指示" });
       next.createDiv({ text: task.next });
     }
-    view.addPatchActions(reply, task, { canvasPath: context.canvasPath, selectedIds: context.selectedIds, patch });
+    view.addPatchActions(reply, task, kanban ? { ...context, patch } : { canvasPath: context.canvasPath, selectedIds: context.selectedIds, patch });
   }
   if (task.error) body.createDiv({ cls: "bc-task-error", text: task.error });
+  if (RERUNNABLE_STATUSES.has(task.status) && String(task.prompt || "").trim()) {
+    const actions = body.createDiv({ cls: "bc-task-actions" });
+    const button = actions.createEl("button", { cls: "bc-rerun", attr: { type: "button" } });
+    const rerunning = Boolean(view.rerunning?.has(taskKey(task)));
+    const availability = view.canRerunTask(task);
+    setIcon(button.createSpan(), "rotate-cw");
+    button.createSpan({ text: rerunning ? "重跑中…" : "重跑" });
+    button.disabled = rerunning || !availability.ok;
+    button.title = !availability.ok && availability.reason ? availability.reason : "使用原指令和上下文重新执行";
+    button.onclick = () => void view.rerunTask(task);
+  }
 }
 
 class BridgeView extends ItemView {
@@ -422,6 +528,7 @@ class BridgeView extends ItemView {
     this.executor = "agy";
     this.mode = "edit_canvas";
     this.autoCapture = true;
+    this.kanbanAutoStatus = true;
     this.lastAutoSignature = "";
     this.repoManual = false;
     this.modelPrefs = { agy: "", codex: "", codexEffort: "" };
@@ -432,6 +539,7 @@ class BridgeView extends ItemView {
     this.providerSubscriptions = new Map();
     this.providerRefreshVersion = 0;
     this.tasks = [];
+    this.rerunning = new Set();
     this.scope = new Scope(this.app.scope);
     this.scope.register(["Mod"], "Enter", event => {
       if (event.target !== this.input || event.isComposing || event.keyCode === 229) return;
@@ -449,9 +557,11 @@ class BridgeView extends ItemView {
     this.signature = null;
     this.latest = null;
     this.tasks = [];
+    this.rerunning = new Set();
     this.providerTasks = [];
     this.providerDiscoveryComplete = false;
     this.autoCapture = this.app.loadLocalStorage(AUTO_CAPTURE) !== false;
+    this.kanbanAutoStatus = this.app.loadLocalStorage(KANBAN_AUTO_STATUS) !== false;
     this.lastAutoSignature = "";
     this.repoManual = false;
     this.modelPrefs = loadModelPrefs(this.app);
@@ -543,6 +653,30 @@ class BridgeView extends ItemView {
     });
     this.repo.onkeydown = event => { if (event.key === "Enter") event.preventDefault(); };
     this.repo.oninput = () => { this.repoManual = true; this.sendError = ""; this.updateComposer(); };
+
+    this.kanbanBar = bar.createDiv({ cls: "bc-kanban-bar" });
+    this.kanbanStatusSelect = this.kanbanBar.createEl("select", {
+      cls: "bc-kanban-status-select dropdown", attr: { "aria-label": "更新看板状态" },
+    });
+    this.kanbanStatusSelect.onchange = async () => {
+      const snapshot = this.context?.snapshot;
+      const status = this.kanbanStatusSelect.value;
+      this.kanbanStatusSelect.value = "";
+      if (!isKanbanContext(this.context) || !status) return;
+      await this.changeKanbanStatus(snapshot, status, this.kanbanStatusSelect);
+    };
+    const autoStatus = this.kanbanBar.createEl("label", { cls: "bc-kanban-auto-label" });
+    this.kanbanAutoToggle = autoStatus.createEl("input", { cls: "bc-kanban-auto-status", attr: { type: "checkbox" } });
+    autoStatus.createSpan({ text: "派活后更新为进行中" });
+    this.kanbanAutoToggle.checked = this.kanbanAutoStatus;
+    this.kanbanAutoToggle.onchange = () => {
+      this.kanbanAutoStatus = this.kanbanAutoToggle.checked;
+      this.app.saveLocalStorage(KANBAN_AUTO_STATUS, this.kanbanAutoStatus);
+    };
+    this.kanbanQuickSend = this.kanbanBar.createEl("button", {
+      cls: "bc-kanban-quick-send", text: "按卡派活", attr: { type: "button" },
+    });
+    this.kanbanQuickSend.onclick = () => this.send({ useKanbanDefault: true });
   }
 
   setExecutor(executor) {
@@ -558,8 +692,11 @@ class BridgeView extends ItemView {
   isBridgeExecutor() { return Object.hasOwn(EXECUTORS, this.executor); }
 
   capabilities() {
-    return this.activeProvider()?.capabilities
+    const provider = this.activeProvider();
+    const capabilities = provider?.capabilities
       || (this.isBridgeExecutor() ? { ...BRIDGE_CAPABILITIES, supportsEffort: this.executor === "codex" } : { modes: [] });
+    return provider?.kind === "http" && isKanbanContext(this.context)
+      ? { ...capabilities, modes: Object.keys(MODES) } : capabilities;
   }
 
   syncProviderControls() {
@@ -583,8 +720,10 @@ class BridgeView extends ItemView {
       this.executorKey = executorKey;
       this.executorButtons = segmentButtons(this.executorGroup, options, value => this.setExecutor(value));
     }
-    const modes = (this.capabilities().modes || []).map(id => [id, Object.hasOwn(MODES, id) ? MODES[id] : id]);
-    if (!modes.some(([id]) => id === this.mode)) this.mode = modes[0]?.[0] || "";
+    const modes = (this.capabilities().modes || []).map(id => [id,
+      id === "edit_canvas" && isKanbanContext(this.context) ? "改卡片/状态" : MODES[id] || id]);
+    this.modeGroup.setAttribute("aria-label", isKanbanContext(this.context) ? "看板模式" : "Canvas 模式");
+    if (modes.length && !modes.some(([id]) => id === this.mode)) this.mode = modes[0][0];
     const modeKey = JSON.stringify(modes);
     if (this.modeKey !== modeKey) {
       this.modeKey = modeKey;
@@ -722,7 +861,9 @@ class BridgeView extends ItemView {
   }
 
   async syncAutoSelection() {
-    if (!this.active || !this.autoCapture || this.sending) return;
+    if (!this.active || !this.autoCapture || this.sending || this.kanbanCapture) return;
+    const activeType = this.app.workspace.activeLeaf?.view?.getViewType?.();
+    if (activeType !== "canvas" && (activeType || isKanbanContext(this.context))) return;
     const peek = this.plugin.peekCanvasSelection();
     if (!peek || peek.signature === this.lastAutoSignature) return;
     await this.captureSelection(undefined, { silent: true, preserveRepo: true, signature: peek.signature });
@@ -736,14 +877,20 @@ class BridgeView extends ItemView {
 
   setSelection(context, { preserveRepo = false } = {}) {
     this.captureVersion++;
-    const sameCanvas = Boolean(context && this.context?.snapshot.canvasPath === context.snapshot.canvasPath);
+    this.kanbanCapture = null;
+    const sameSource = Boolean(context && this.context && (isKanbanContext(context)
+      ? isKanbanContext(this.context) && this.context.snapshot.boardPath === context.snapshot.boardPath
+      : !isKanbanContext(this.context) && this.context.snapshot.canvasPath === context.snapshot.canvasPath));
+    if (isKanbanContext(context) !== isKanbanContext(this.context)) this.mode = context?.kind === "kanban" ? "execute_task" : "edit_canvas";
+    if (isKanbanContext(context)) this.lastAutoSignature = "";
     this.context = context;
-    if (!preserveRepo || !this.repoManual || !sameCanvas) {
+    if (!preserveRepo || !this.repoManual || !sameSource) {
       this.repo.value = context?.snapshot.detectedRepo || "";
       this.repoManual = false;
     }
     this.sendError = "";
     this.updateComposer();
+    this.plugin.scheduleKanbanSync();
   }
 
   async captureSelection(hint, { silent = false, preserveRepo = false, signature = "" } = {}) {
@@ -793,10 +940,23 @@ class BridgeView extends ItemView {
       || (!this.executor && this.providerDiscoveryComplete ? this.plugin.providerLoadError || PROVIDER_GUIDANCE : ""));
     this.input.placeholder = label ? `给 ${label} 下指令…` : "输入协作指令…";
     const snapshot = this.context?.snapshot;
-    this.selectionLabel.setText(snapshot
+    const kanban = isKanbanContext(this.context);
+    this.selectionLabel.setText(kanban
+      ? `${path.basename(snapshot.boardPath, ".base") || snapshot.viewName || "看板"} · ${snapshot.cards.length} 张卡片`
+      : snapshot
       ? `${path.basename(snapshot.canvasPath)} · ${snapshot.effectiveNodeIds.length} 节点（分组展开 ${snapshot.expandedFromGroupIds.length}） · ${snapshot.internalEdges.length + snapshot.incomingEdges.length + snapshot.outgoingEdges.length} 连线`
       : "Canvas 未选取");
-    this.selectionLabel.title = snapshot?.canvasPath || "";
+    this.selectionLabel.title = snapshot?.boardPath || snapshot?.canvasPath || "";
+    if (this.kanbanBar) this.kanbanBar.hidden = !kanban;
+    if (this.autoToggle) this.autoToggle.hidden = kanban;
+    if (kanban && this.kanbanStatusSelect) {
+      const options = snapshot.statusOptions || [];
+      const key = JSON.stringify(options);
+      if (key !== this.kanbanStatusKey) {
+        this.kanbanStatusKey = key;
+        fillSelect(this.kanbanStatusSelect, [{ value: "", label: "更新看板状态" }, ...options.map(value => ({ value, label: value }))], "");
+      }
+    }
     this.repoRow.hidden = !snapshot || !this.capabilities().supportsRepo;
     this.clear.hidden = !snapshot;
     this.syncModelSelectors();
@@ -804,7 +964,7 @@ class BridgeView extends ItemView {
   }
 
   updateButton() {
-    this.submit.disabled = this.sending || !this.isReady() || !this.input.value.trim();
+    this.submit.disabled = this.sending || this.changingKanbanStatus || !this.isReady() || !this.input.value.trim();
     this.input.readOnly = this.sending;
     this.repo.readOnly = this.sending;
     if (this.modelSelect) this.modelSelect.disabled = this.sending || !this.modelSelect.options?.length;
@@ -815,6 +975,11 @@ class BridgeView extends ItemView {
     }
     this.capture.disabled = this.sending;
     this.clear.disabled = this.sending;
+    if (this.kanbanQuickSend) {
+      this.kanbanQuickSend.disabled = this.sending || this.changingKanbanStatus || !this.isReady();
+      this.kanbanStatusSelect.disabled = this.sending || this.changingKanbanStatus || !this.context?.snapshot.statusOptions?.length;
+      this.kanbanAutoToggle.disabled = this.sending;
+    }
     for (const [value, button] of this.executorButtons) {
       button.disabled = this.sending;
       button.setAttribute("aria-pressed", String(value === this.executor));
@@ -861,9 +1026,135 @@ class BridgeView extends ItemView {
     else component.unload?.();
   }
 
+  canRerunTask(task) {
+    if (!task || !RERUNNABLE_STATUSES.has(task.status) || !String(task.prompt || "").trim()) {
+      return { ok: false, reason: "" };
+    }
+    const executor = task.executor || "agy";
+    if (executor === "codex") {
+      return this.route?.codex_ready
+        ? { ok: true, reason: "" }
+        : { ok: false, reason: this.route?.codex_error || "Codex 未就绪" };
+    }
+    if (executor === "agy") {
+      return this.route?.paired
+        ? { ok: true, reason: "" }
+        : { ok: false, reason: this.route?.reason || "AGY 待配对" };
+    }
+    const adapter = this.plugin.providers?.get(executor);
+    const status = this.providerStates?.get(executor);
+    if (!adapter || adapter.enabled === false || !(status?.adapter === adapter && status.value?.ready)) {
+      return {
+        ok: false,
+        reason: status?.value?.message || `${task.providerLabel || executor} 未就绪`,
+      };
+    }
+    return { ok: true, reason: "" };
+  }
+
+  rerunPayload(task) {
+    const executor = task.executor || "agy";
+    if (executor === "codex") {
+      const models = this.codexModels();
+      const originalModel = task.model;
+      const model = originalModel && (models.some(item => item.id === originalModel)
+        || originalModel === this.route?.codex_model || !models.length)
+        ? originalModel : this.selectedCodexModel();
+      const entry = models.find(item => item.id === model);
+      const efforts = Array.isArray(entry?.efforts) ? entry.efforts : [];
+      const effort = task.effort && (!efforts.length || efforts.includes(task.effort))
+        ? task.effort : this.selectedCodexEffort();
+      return {
+        action: "rerun_codex", job_id: task.id,
+        ...(model ? { model } : {}), ...(effort ? { effort } : {}),
+      };
+    }
+    if (executor === "agy") {
+      return {
+        action: "send", project: this.route.project, conversation: this.route.conversation, text: task.prompt,
+        replace_request_id: task.id, ...(task.model ? { model: task.model } : {}),
+      };
+    }
+    const kanban = this.plugin.kanbanContext?.parseKanbanPromptEnvelope(task.prompt)?.metadata;
+    if (kanban?.kind === "kanban") {
+      return {
+        workspace: this.workspacePath, targetWorkspace: task.targetWorkspace || kanban.targetWorkspace || this.workspacePath,
+        executor, mode: task.mode || kanban.mode, prompt: task.prompt,
+        boardPath: kanban.boardPath, cardPaths: kanban.cardPaths, source: task.source || "Obsidian", rerunId: task.id,
+        ...(task.model ? { model: task.model } : {}), ...(task.effort ? { effort: task.effort } : {}),
+      };
+    }
+    const parsed = this.plugin.canvasContext?.parseCanvasPromptEnvelope(task.prompt);
+    const context = taskCanvas(task, parsed?.metadata);
+    const mode = context.mode || parsed?.metadata?.mode || "edit_canvas";
+    const canvasPath = context.canvasPath
+      || (typeof parsed?.metadata?.canvasPath === "string" ? parsed.metadata.canvasPath : "");
+    const selectedIds = Array.isArray(context.selectedIds)
+      ? context.selectedIds
+      : (Array.isArray(parsed?.metadata?.selectedIds) ? parsed.metadata.selectedIds : []);
+    return {
+      workspace: this.workspacePath, targetWorkspace: task.targetWorkspace || this.workspacePath,
+      executor, mode, prompt: task.prompt, canvasPath, selectedIds, source: task.source || "Obsidian", rerunId: task.id,
+      ...(task.model ? { model: task.model } : {}), ...(task.effort ? { effort: task.effort } : {}),
+    };
+  }
+
+  async rerunTask(task) {
+    const key = taskKey(task);
+    const rerunning = this.rerunning;
+    if (rerunning.has(key)) return;
+    const availability = this.canRerunTask(task);
+    if (!availability.ok) {
+      this.sendError = availability.reason || "当前执行者未就绪，无法重跑。";
+      if (typeof Notice === "function") new Notice(this.sendError);
+      this.updateComposer();
+      return;
+    }
+    rerunning.add(key);
+    this.showTasks(this.tasks);
+    const token = randomUUID();
+    const executor = task.executor || "agy";
+    const isBridge = Object.hasOwn(EXECUTORS, executor);
+    const refresh = isBridge ? () => this.refresh() : () => this.refreshProviders();
+    try {
+      const payload = this.rerunPayload(task);
+      const provider = this.plugin.providers?.get(executor);
+      let result;
+      if (provider) {
+        result = await provider.dispatch({ ...payload, workspace: this.workspacePath, token });
+      } else if (isBridge) {
+        result = await this.plugin.callBridge(this.workspacePath, { ...payload, token });
+      } else {
+        throw new Error("执行者不可用。");
+      }
+      if (result?.ok === false) throw new Error(result.error || "执行者未接受重跑指令。");
+      if (result?.settled) {
+        void Promise.resolve(result.settled).then(
+          refresh,
+          error => { if (this.active) { this.sendError = error?.message || String(error); this.updateComposer(); } },
+        );
+      }
+    } catch (error) {
+      this.sendError = error.message;
+      if (typeof Notice === "function") new Notice(`重跑失败 · ${error.message}`);
+      this.updateComposer();
+    } finally {
+      try {
+        if (this.active) await refresh();
+      } finally {
+        rerunning.delete(key);
+        if (this.active) this.showTasks(this.tasks);
+      }
+    }
+  }
+
   showTasks(tasks) {
     this.tasks = tasks;
-    const signature = JSON.stringify([tasks, this.plugin.appliedPatches]);
+    const signature = JSON.stringify([
+      tasks, this.plugin.appliedPatches,
+      tasks.map(task => RERUNNABLE_STATUSES.has(task.status) ? this.canRerunTask(task) : null),
+      [...this.rerunning].sort(),
+    ]);
     if (signature === this.signature) return;
     this.signature = signature;
     const expanded = new Set(Array.from(this.list.querySelectorAll("details.bc-task[open]"), el => el.dataset.taskKey));
@@ -888,16 +1179,23 @@ class BridgeView extends ItemView {
   }
 
   addPatchActions(reply, task, context) {
-    const patch = context.patch === undefined ? this.plugin.canvasContext?.extractCanvasPatch(task.reply) : context.patch;
+    const kanban = isKanbanContext(context);
+    const patch = context.patch === undefined
+      ? (kanban ? this.plugin.kanbanContext.extractKanbanPatch(task.reply) : this.plugin.canvasContext?.extractCanvasPatch(task.reply))
+      : context.patch;
     if (!patch) return;
     const actions = reply.createDiv({ cls: "bc-patch" });
     if (isPatchError(patch)) {
       actions.createSpan({ cls: "bc-task-error", text: patch.error });
       return;
     }
-    actions.createSpan({ text: patchPreview(patch) });
-    if (!context.canvasPath || !Array.isArray(context.selectedIds) || !context.selectedIds.length) {
-      actions.createSpan({ cls: "bc-task-error", text: "这条指令没有锁定 Canvas 选区。" });
+    const target = kanban ? "看板" : "Canvas";
+    const { summary } = kanban ? this.plugin.kanbanContext.validateKanbanPatch(patch, {
+      allowedCardPaths: context.cardPaths, statusOptions: context.statusOptions, statusProperty: context.statusProperty,
+    }) : {};
+    actions.createSpan({ text: kanban ? `更新 ${summary.updated} · 跳过 ${summary.skipped}` : patchPreview(patch) });
+    if (kanban ? !context.cardPaths?.length : !context.canvasPath || !Array.isArray(context.selectedIds) || !context.selectedIds.length) {
+      actions.createSpan({ cls: "bc-task-error", text: `这条指令没有锁定 ${target} 选区。` });
       return;
     }
     const key = taskKey(task);
@@ -911,12 +1209,13 @@ class BridgeView extends ItemView {
         revert.onclick = async () => {
           revert.disabled = true;
           try {
-            const summary = await this.plugin.revertReplyPatch(key);
-            if (summary) new Notice(`已撤销 Canvas 补丁 · ${revertCounts(summary)}`);
+            const result = await this.plugin.revertReplyPatch(key);
+            if (result) new Notice(`已撤销 ${target} 补丁 · ${kanban ? `恢复 ${result.restored} 张卡片` : revertCounts(result)}`);
             if (this.active) this.showTasks(this.tasks);
           } catch (error) {
             revert.disabled = false;
-            new Notice(`撤销 Canvas 补丁失败 · ${error.message}`);
+            new Notice(`撤销 ${target} 补丁失败 · ${error.message}`);
+            if (this.active) this.showTasks(this.tasks);
           }
         };
       } else {
@@ -925,18 +1224,51 @@ class BridgeView extends ItemView {
       }
       return;
     }
-    const button = controls.createEl("button", { text: "应用到画布", attr: { type: "button" } });
+    if (kanban && !summary.updated) return;
+    const button = controls.createEl("button", { text: kanban ? "应用到看板" : "应用到画布", attr: { type: "button" } });
     button.onclick = async () => {
       button.disabled = true;
       try {
-        const summary = await this.plugin.applyReplyPatch(key, context, patch);
-        if (summary) new Notice(`Canvas 补丁已应用 · ${patchCounts(summary)}`);
+        const result = await (kanban ? this.plugin.applyKanbanReplyPatch(key, context, patch) : this.plugin.applyReplyPatch(key, context, patch));
+        if (result) new Notice(`${target} 补丁已应用 · ${kanban ? `更新 ${result.updated} · 跳过 ${result.skipped}` : patchCounts(result)}`);
         if (this.active) this.showTasks(this.tasks);
+        button.disabled = false;
       } catch (error) {
         button.disabled = false;
-        new Notice(`Canvas 补丁应用失败 · ${error.message}`);
+        new Notice(`${target} 补丁应用失败 · ${error.message}`);
+        if (this.active) this.showTasks(this.tasks);
       }
     };
+  }
+
+  addKanbanStatusActions(body, context) {
+    if (!context.cardPaths?.length || !context.statusOptions?.length) return;
+    const actions = body.createDiv({ cls: "bc-kanban-status-actions" });
+    for (const status of context.statusOptions) {
+      const button = actions.createEl("button", {
+        cls: "bc-kanban-quick-status", text: status,
+        attr: { type: "button", title: `更新看板状态为 ${status}` },
+      });
+      button.onclick = () => this.changeKanbanStatus(context, status, button);
+    }
+  }
+
+  async changeKanbanStatus(context, status, control) {
+    if (this.sending || this.changingKanbanStatus) return;
+    const cardPaths = context.cardPaths || context.cards.map(card => card.path);
+    this.changingKanbanStatus = true;
+    control.disabled = true;
+    this.updateButton();
+    try {
+      const { updated, skipped } = await this.plugin.updateKanbanCardStatus(cardPaths, status, context.statusProperty);
+      new Notice(`看板状态 · 更新 ${updated} · 跳过 ${skipped}`);
+    } catch (error) {
+      new Notice(`更新看板状态失败 · ${error.message}`);
+    } finally {
+      this.changingKanbanStatus = false;
+      control.disabled = false;
+      if (this.active) this.updateButton();
+    }
   }
 
   updateHistory() {
@@ -1062,20 +1394,27 @@ class BridgeView extends ItemView {
     const targetWorkspace = selected && supportsRepo ? this.repo.value.trim() || this.workspacePath : this.workspacePath;
     const executor = this.executor;
     const mode = !selected && modes?.includes("execute_task") ? "execute_task" : this.mode;
-    const text = selected ? this.plugin.canvasContext.buildCanvasPromptEnvelope({
+    const kanban = isKanbanContext(selected);
+    const text = kanban ? this.plugin.kanbanContext.buildKanbanPromptEnvelope({
+      userInstruction: instruction, executor, mode, kanbanSnapshot: selected.snapshot,
+      targetRepo: supportsRepo ? targetWorkspace : "",
+    }) : selected ? this.plugin.canvasContext.buildCanvasPromptEnvelope({
       userInstruction: instruction, executor, mode,
       canvasSnapshot: supportsRepo ? selected.snapshot : { ...selected.snapshot, detectedRepo: "" },
       fileExcerpts: selected.fileExcerpts, targetRepo: supportsRepo ? targetWorkspace : "",
     }) : instruction;
     const canvasPath = selected?.snapshot.canvasPath || "";
     const selectedIds = selected?.snapshot.effectiveNodeIds || [];
+    const boardPath = kanban ? selected.snapshot.boardPath : "";
+    const cardPaths = kanban ? selected.snapshot.cards.map(card => card.path) : [];
     if (!this.isBridgeExecutor()) {
       const label = this.plugin.providerLabel(executor).replace(/[\r\n]+/g, " ");
       return {
         workspace: this.workspacePath, targetWorkspace, executor, mode,
         // The shared envelope uses the legacy AGY label for non-Codex executors.
         prompt: selected ? text.replace(/\n执行者 AGY · 模式 /, () => `\n执行者 ${label} · 模式 `) : text,
-        canvasPath, selectedIds, source: "Obsidian", model: this.selectedProviderModel(),
+        ...(kanban ? { boardPath, cardPaths } : { canvasPath, selectedIds }),
+        source: "Obsidian", model: this.selectedProviderModel(),
         ...(this.capabilities().supportsEffort && this.effortSelect?.value ? { effort: this.effortSelect.value } : {}),
       };
     }
@@ -1091,14 +1430,16 @@ class BridgeView extends ItemView {
     return {
       action: "dispatch_codex", text, mode, target_workspace: targetWorkspace,
       ...(model ? { model } : {}), ...(effort ? { effort } : {}),
-      step_goal: selected ? `Obsidian Canvas：${MODES[mode]}` : "处理 Obsidian 指令",
-      canvas_path: canvasPath, selected_ids: selectedIds,
+      step_goal: kanban ? `Obsidian 看板：${mode === "edit_canvas" ? "改卡片/状态" : MODES[mode]}`
+        : selected ? `Obsidian Canvas：${MODES[mode]}` : "处理 Obsidian 指令",
+      ...(kanban ? { board_path: boardPath, card_paths: cardPaths } : { canvas_path: canvasPath, selected_ids: selectedIds }),
     };
   }
 
-  async send() {
-    const text = this.input.value.trim();
-    if (!text || !this.isReady() || this.sending) return;
+  async send({ useKanbanDefault = false } = {}) {
+    const kanbanSnapshot = isKanbanContext(this.context) ? this.context.snapshot : null;
+    const text = this.input.value.trim() || (useKanbanDefault && kanbanSnapshot ? DEFAULT_KANBAN_INSTRUCTION : "");
+    if (!text || !this.isReady() || this.sending || this.changingKanbanStatus) return;
     const refresh = this.isBridgeExecutor() ? () => this.refresh() : () => this.refreshProviders();
     this.sending = true;
     this.sendError = "";
@@ -1123,6 +1464,20 @@ class BridgeView extends ItemView {
       if (this.app.loadLocalStorage(DRAFT)?.token === token) this.app.saveLocalStorage(DRAFT, null);
       this.draft = { token: randomUUID(), text: "" };
       if (this.active) this.input.value = "";
+      if (kanbanSnapshot && this.kanbanAutoStatus) {
+        const { statusOptions, statusProperty, cards } = kanbanSnapshot;
+        const { inferInProgressStatus, isInitialStatus } = this.plugin.kanbanContext;
+        const status = inferInProgressStatus(statusOptions);
+        if (status) {
+          try {
+            await this.plugin.updateKanbanCardStatus(cards.map(card => card.path), status, statusProperty, {
+              when: current => isInitialStatus(current, statusOptions),
+            });
+          } catch (error) {
+            this.sendError = `已派活，自动更新看板状态失败 · ${error.message}`;
+          }
+        }
+      }
     } catch (error) {
       this.sendError = error.message;
     } finally {
@@ -1138,6 +1493,7 @@ class BridgeView extends ItemView {
     this.active = false;
     this.providerRefreshVersion++;
     this.plugin.openViews.delete(this);
+    this.plugin.scheduleKanbanSync();
     this.syncSubscriptions([]);
     this.clearRenderComponent();
     this.captureVersion++;
@@ -1238,17 +1594,22 @@ module.exports = class BridgeChatPlugin extends Plugin {
   onload() {
     this.appliedPatches = this.app.loadLocalStorage(APPLIED) || {};
     this.applyingCanvases = new Set();
+    this.writingKanbanFiles = new Set();
+    this.applyingKanbanPatches = new Set();
+    this.kanbanObservers = new Map();
     this.openViews = new Set();
     this.httpProviders = new Map();
     this.bridgeProviders = new Map();
     this.canvasLoadError = "";
     this.ensureCanvasContext();
+    this.ensureKanbanContext();
     this.settingsReady = this.initializeProviders();
     if (CanvasBridgeSettingTab && this.addSettingTab) {
       this.settingsTab = new CanvasBridgeSettingTab(this.app, this);
       this.addSettingTab(this.settingsTab);
     }
     this.lastCanvasLeaf = this.app.workspace.getMostRecentLeaf();
+    if (this.lastCanvasLeaf?.view?.getViewType?.() === "bases") this.lastBasesLeaf = this.lastCanvasLeaf;
     this.registerView(VIEW, leaf => new BridgeView(leaf, this));
     this.addRibbonIcon("messages-square", "打开协作对话", () => this.openPanel());
     this.addCommand({ id: "open", name: "打开协作对话", callback: () => this.openPanel() });
@@ -1266,10 +1627,25 @@ module.exports = class BridgeChatPlugin extends Plugin {
     });
     this.registerEvent(this.app.workspace.on("active-leaf-change", leaf => {
       if (leaf?.view?.getViewType() === "canvas") this.lastCanvasLeaf = leaf;
+      if (leaf?.view?.getViewType() === "bases") this.lastBasesLeaf = leaf;
+      this.scheduleKanbanSync();
     }));
+    this.registerEvent(this.app.workspace.on("layout-change", () => this.scheduleKanbanSync()));
+    if (this.app.metadataCache?.on) this.registerEvent(this.app.metadataCache.on("changed", () => this.scheduleKanbanSync()));
+    this.registerEvent(this.app.workspace.on("file-menu", (menu, file) => this.registerKanbanMenu(menu, file)));
+    this.addCommand({ id: "capture-kanban-card", name: "抓取当前看板卡片到协作对话", callback: () => this.captureKanbanCardInPanel() });
     this.registerCanvasMenu("canvas:node-menu", node => ({ canvas: node?.canvas, ids: selectionIds([node]) }));
     this.registerCanvasMenu("canvas:selection-menu", canvas => ({ canvas, ids: selectionIds(canvas?.selection) }));
+    this.app.workspace.onLayoutReady?.(() => this.scheduleKanbanSync());
+    this.scheduleKanbanSync();
     return this.settingsReady;
+  }
+
+  onunload() {
+    this.kanbanUnloaded = true;
+    window.clearTimeout(this.kanbanTimer);
+    for (const board of this.kanbanObservers.values()) this.disconnectKanbanBoard(board);
+    this.kanbanObservers.clear();
   }
 
   pluginDir() {
@@ -1455,6 +1831,316 @@ module.exports = class BridgeChatPlugin extends Plugin {
     }
   }
 
+  ensureKanbanContext() {
+    if (this.kanbanContext) return this.kanbanContext;
+    const dir = this.pluginDir();
+    if (!dir) return null;
+    try {
+      this.kanbanContext = loadLocalModule(dir, "kanban_context.js", LOCAL_BUILTINS);
+      this.kanbanLoadError = "";
+      return this.kanbanContext;
+    } catch (error) {
+      this.kanbanLoadError = error.message || String(error);
+      return null;
+    }
+  }
+
+  resolveBasesBoardMeta(leaf) {
+    const view = leaf?.view;
+    const controller = view?.controller;
+    const subView = controller?.view;
+    if (view?.getViewType?.() !== "bases" || subView?.type !== "kanban") return null;
+    const context = this.kanbanContext;
+    if (!context) return null;
+    const columns = Array.from(subView.columns || []);
+    const setting = (view, key) => view?.config?.get?.(key) ?? view?.get?.(key) ?? view?.config?.[key] ?? view?.[key];
+    const grouping = view => context.stripNotePrefix(setting(view, "groupBy")?.property);
+    const statusGrouping = view => ["status", "状态"].includes(grouping(view).toLowerCase());
+    const orderedKeys = (...sources) => {
+      for (const source of sources) {
+        if (!source || typeof source === "string" || !source[Symbol.iterator]) continue;
+        const keys = [...new Set(Array.from(source, groupKeyOf).filter(value => value != null && String(value).trim()).map(String))];
+        if (keys.length) return keys;
+      }
+      return [];
+    };
+    const groupBy = grouping(subView);
+    const groupOrder = orderedKeys(subView.orderedGroups, setting(subView, "groupOrder"), columns.map(col => col.group));
+    const activeStatus = statusGrouping(subView);
+    const queryViews = controller.query?.views || view.query?.views;
+    const candidates = Array.isArray(queryViews) ? queryViews : queryViews?.values?.() || [];
+    const canonical = !activeStatus && Array.from(candidates).find(view => setting(view, "type") === "kanban" && statusGrouping(view));
+    const statusProperty = activeStatus ? groupBy : canonical ? grouping(canonical) : "status";
+    let statusOptions = activeStatus ? groupOrder : canonical ? orderedKeys(canonical.orderedGroups, setting(canonical, "groupOrder")) : [];
+    if (canonical && !statusOptions.length) {
+      const values = new Set();
+      for (const col of columns) {
+        for (const entry of col.group?.entries || []) {
+          if (!entry.file) continue;
+          const status = this.app.metadataCache?.getFileCache?.(entry.file)?.frontmatter?.[statusProperty];
+          if (typeof status === "string" && status.trim()) values.add(status);
+        }
+      }
+      const direction = setting(canonical, "groupBy")?.direction === "DESC" ? -1 : 1;
+      statusOptions = [...values].sort((a, b) => direction * a.localeCompare(b));
+    }
+    return {
+      leaf, subView, columns, container: subView.containerEl || view.contentEl,
+      boardPath: view.file?.path || leaf.getViewState?.()?.state?.file || "", viewName: controller.viewName || "",
+      groupBy, groupOrder, statusProperty, statusOptions,
+    };
+  }
+
+  scheduleKanbanSync() {
+    if (this.kanbanUnloaded || this.syncingKanbanDom || !this.kanbanContext) return;
+    const timer = globalThis.window || globalThis;
+    timer.clearTimeout?.(this.kanbanTimer);
+    this.kanbanTimer = timer.setTimeout?.(() => this.syncKanbanBoards(), 35);
+  }
+
+  disconnectKanbanBoard(board) {
+    board.observer?.disconnect();
+    for (const [event, listener, capture] of board.listeners) board.container.removeEventListener(event, listener, capture);
+    for (const [el, binding] of board.cards) this.clearKanbanCard(el, binding.overlay);
+  }
+
+  clearKanbanCard(el, overlay) {
+    overlay?.remove();
+    delete el.dataset.bcFile;
+    el.classList.remove("bc-kanban-selected");
+  }
+
+  syncKanbanBoards() {
+    if (this.kanbanUnloaded || this.syncingKanbanDom || !this.kanbanContext) return;
+    window.clearTimeout(this.kanbanTimer);
+    this.syncingKanbanDom = true;
+    try {
+      const boards = this.app.workspace.getLeavesOfType("bases").map(leaf => this.resolveBasesBoardMeta(leaf)).filter(meta => meta?.container);
+      const containers = new Set(boards.map(meta => meta.container));
+      for (const [container, board] of this.kanbanObservers) {
+        if (containers.has(container)) continue;
+        this.disconnectKanbanBoard(board);
+        this.kanbanObservers.delete(container);
+      }
+      for (const meta of boards) {
+        let board = this.kanbanObservers.get(meta.container);
+        if (!board) {
+          const { container } = meta;
+          board = { container, cards: new Map(), listeners: [] };
+          const bindingAt = event => {
+            const binding = board.cards.get(event.target?.closest?.(".bases-kanban-card"));
+            return binding && binding.item.entry?.file === binding.file ? binding : null;
+          };
+          const remember = event => {
+            const binding = bindingAt(event);
+            if (binding) this.lastKanbanCard = { leaf: binding.leaf, file: binding.file, column: binding.column };
+            return binding;
+          };
+          const captureClick = event => {
+            const binding = remember(event);
+            if (!binding || !event.altKey) return;
+            event.preventDefault();
+            event.stopPropagation();
+            const { leaf, file, column } = binding;
+            void this.captureKanbanCardInPanel({ leaf, file, column, additive: event.shiftKey || event.ctrlKey || event.metaKey });
+          };
+          const stopAltDrag = event => {
+            if (!event.altKey || !remember(event)) return;
+            if (event.type === "mousedown") event.preventDefault();
+            event.stopPropagation();
+          };
+          board.listeners = [["click", captureClick, true], ["pointerdown", stopAltDrag, true],
+            ["mousedown", stopAltDrag, true], ["pointerover", remember, false], ["focusin", remember, false]];
+          for (const [event, listener, capture] of board.listeners) container.addEventListener(event, listener, capture);
+          const Observer = container.ownerDocument?.defaultView?.MutationObserver || globalThis.MutationObserver;
+          if (Observer) {
+            board.observer = new Observer(() => this.scheduleKanbanSync());
+            board.observer.observe(container, { childList: true, subtree: true });
+          }
+          this.kanbanObservers.set(container, board);
+        }
+        const selected = new Set();
+        for (const view of this.openViews) {
+          if (!isKanbanContext(view.context) || view.context.snapshot.boardPath !== meta.boardPath) continue;
+          for (const card of view.context.snapshot.cards) selected.add(card.path);
+        }
+        const bindings = new Map();
+        for (const col of meta.columns) {
+          const column = String(groupKeyOf(col.group) ?? "");
+          for (const item of col.items || []) {
+            const { el } = item;
+            const file = item.entry?.file;
+            if (!el || file?.extension?.toLowerCase() !== "md" || !meta.container.contains(el)) continue;
+            const binding = board.cards.get(el) || {};
+            Object.assign(binding, { leaf: meta.leaf, file, column, item });
+            bindings.set(el, binding);
+            el.dataset.bcFile = file.path;
+            el.classList.toggle("bc-kanban-selected", selected.has(file.path));
+            if (binding.overlay?.parentElement !== el) {
+              binding.overlay = el.createDiv({ cls: "bc-kanban-overlay" });
+              binding.chip = binding.overlay.createSpan({ cls: "bc-kanban-status-chip" });
+              const dispatch = binding.overlay.createEl("button", { cls: "bc-kanban-dispatch-btn", text: "派活", attr: { type: "button" } });
+              dispatch.addEventListener("pointerdown", event => event.stopPropagation());
+              dispatch.addEventListener("mousedown", event => { event.preventDefault(); event.stopPropagation(); });
+              dispatch.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") event.stopPropagation(); });
+              dispatch.onclick = event => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (binding.item.entry?.file !== binding.file) return;
+                const { leaf, file, column } = binding;
+                this.lastKanbanCard = { leaf, file, column };
+                void this.captureKanbanCardInPanel({ leaf, file, column, additive: event.shiftKey || event.ctrlKey || event.metaKey });
+              };
+            }
+            const status = meta.groupBy !== meta.statusProperty
+              ? String(this.app.metadataCache?.getFileCache?.(file)?.frontmatter?.[meta.statusProperty] ?? "")
+              : "";
+            if (binding.chip.textContent !== status) binding.chip.setText(status);
+            binding.chip.hidden = !status;
+          }
+        }
+        for (const [el, binding] of board.cards) if (!bindings.has(el)) this.clearKanbanCard(el, binding.overlay);
+        board.cards = bindings;
+      }
+    } finally {
+      this.syncingKanbanDom = false;
+    }
+  }
+
+  findKanbanCard(file, preferredLeaf) {
+    const workspace = this.app.workspace;
+    const leaves = workspace.getLeavesOfType("bases");
+    const boards = [...new Set([preferredLeaf, workspace.activeLeaf, this.lastBasesLeaf, ...leaves])]
+      .filter(leaf => leaves.includes(leaf)).map(leaf => this.resolveBasesBoardMeta(leaf)).filter(Boolean);
+    for (const board of boards) {
+      for (const col of board.columns) {
+        const item = Array.from(col.items || []).find(item => kanbanPathOf(item) === file.path);
+        if (item || col.group?.entries?.some(entry => entry.file?.path === file.path)) {
+          return { ...board, file, column: String(groupKeyOf(col.group) ?? "") };
+        }
+      }
+    }
+    return null;
+  }
+
+  registerKanbanMenu(menu, file) {
+    if (file?.extension?.toLowerCase() !== "md" || !menu?.addItem || !this.kanbanContext) return;
+    const hint = this.findKanbanCard(file) || { file };
+    const add = (title, icon, executor) => menu.addItem(item => item.setTitle(title).setIcon(icon)
+      .onClick(() => this.captureKanbanCardInPanel({ ...hint, executor })));
+    add("抓取卡片到协作对话", "scan");
+    if (this.settings?.enableBridge) {
+      add("用 Codex 派活", "send-horizontal", "codex");
+      add("用 AGY 派活", "send-horizontal", "agy");
+    }
+  }
+
+  async captureKanbanCardInPanel(hint = {}) {
+    try {
+      if (!this.ensureKanbanContext()) throw new Error(`无法加载 Kanban 协作模块 · ${this.kanbanLoadError || "找不到插件目录"}`);
+      const { workspace } = this.app;
+      const activeLeaf = workspace.activeLeaf;
+      const activeFile = workspace.getActiveFile?.();
+      const remembered = this.lastKanbanCard;
+      const preferred = this.resolveBasesBoardMeta(activeLeaf) || this.resolveBasesBoardMeta(this.lastBasesLeaf);
+      if (!hint.file) {
+        const focused = preferred?.container?.ownerDocument?.activeElement?.closest?.(".bases-kanban-card");
+        const binding = this.kanbanObservers.get(preferred?.container)?.cards.get(focused);
+        const last = preferred?.leaf && remembered?.leaf === preferred.leaf ? this.findKanbanCard(remembered.file, preferred.leaf) : null;
+        const current = activeFile?.extension?.toLowerCase() === "md" ? this.findKanbanCard(activeFile) || { file: activeFile } : null;
+        hint = binding || (activeLeaf === preferred?.leaf ? last || current : current || last) || {};
+      }
+      if (!hint.file) throw new Error("请先将鼠标移到看板卡片上，或点击卡片的派活按钮。");
+      const fm = this.app.metadataCache?.getFileCache?.(hint.file)?.frontmatter || {};
+      const resolved = this.resolveBasesBoardMeta(hint.leaf) || this.findKanbanCard(hint.file, hint.leaf) || {
+        boardPath: "", viewName: "", groupBy: "", groupOrder: [],
+        statusProperty: !Object.hasOwn(fm, "status") && Object.hasOwn(fm, "状态") ? "状态" : "status", statusOptions: [],
+      };
+      const view = await this.openPanel();
+      if (!view || view.sending || !view.active) return;
+      const existing = view.kanbanCapture || view.context;
+      const sameBoard = isKanbanContext(existing) && existing.snapshot.boardPath === resolved.boardPath
+        && existing.snapshot.viewName === resolved.viewName && existing.snapshot.statusProperty === resolved.statusProperty;
+      const cards = new Map(hint.additive && sameBoard ? existing.snapshot.cards.map(card => [card.path, card]) : []);
+      cards.set(hint.file.path, { path: hint.file.path, file: hint.file, column: hint.column ?? resolved.column ?? "" });
+      const version = ++view.captureVersion;
+      view.kanbanCapture = { kind: "kanban", snapshot: { ...resolved, cards: [...cards.values()] } };
+      let context;
+      try {
+        context = await this.getKanbanSelection({ ...resolved, cards: [...cards.values()] });
+      } finally {
+        if (version === view.captureVersion) view.kanbanCapture = null;
+      }
+      if (!view.active || view.sending || version !== view.captureVersion) return;
+      view.mode = "execute_task";
+      view.setSelection(context, { preserveRepo: hint.additive });
+      if (hint.executor) {
+        if (!view.setExecutor(hint.executor)) { new Notice(PROVIDER_GUIDANCE); return; }
+        if (view.isReady()) await view.send({ useKanbanDefault: true });
+      }
+      view.input.focus();
+      return context;
+    } catch (error) {
+      new Notice(error.message);
+    }
+  }
+
+  async getKanbanSelection(hint) {
+    const kanban = this.ensureKanbanContext();
+    const meta = hint?.statusProperty ? hint : this.resolveBasesBoardMeta(hint?.leaf);
+    if (!meta || !kanban) throw new Error("请先打开 Bases 看板。");
+    const { boardPath, viewName, groupBy, groupOrder, statusProperty, statusOptions } = meta;
+    const cards = await Promise.all((hint.cards || [hint]).map(async card => {
+      const file = card.file || this.app.vault.getFileByPath(card.path);
+      if (file?.extension?.toLowerCase() !== "md") throw new Error(`找不到看板卡片 ${card.path || ""}。`);
+      const { position, ...frontmatter } = this.app.metadataCache?.getFileCache?.(file)?.frontmatter || {};
+      return {
+        path: file.path, title: file.basename || path.basename(file.path, ".md"),
+        column: card.column || String(frontmatter[groupBy] ?? ""), status: String(frontmatter[statusProperty] ?? ""),
+        frontmatter, excerpt: (await this.app.vault.cachedRead(file)).slice(0, 8000),
+      };
+    }));
+    const detectedRepo = cards.map(kanban.detectRepoFromCard).find(Boolean) || "";
+    return { kind: "kanban", snapshot: { boardPath, viewName, groupBy, groupOrder, statusProperty, statusOptions, cards, detectedRepo } };
+  }
+
+  async focusKanbanCard(boardPath, cardPath) {
+    const workspace = this.app.workspace;
+    const boards = workspace.getLeavesOfType("bases").map(leaf => this.resolveBasesBoardMeta(leaf))
+      .filter(board => board?.boardPath === boardPath);
+    for (const board of boards) {
+      const rendered = column => Array.from(column.items || []).find(item => kanbanPathOf(item) === cardPath)?.el;
+      const colIndex = board.columns.findIndex(column => rendered(column) || column.group?.entries?.some(entry => entry.file?.path === cardPath));
+      if (colIndex < 0) continue;
+      await workspace.revealLeaf?.(board.leaf);
+      const col = board.columns[colIndex];
+      const { measurements, scrollEl } = board.subView;
+      if (!rendered(col) && measurements?.cardHeight) {
+        // Bases materializes both columns and cards from the current scroll offsets.
+        if (scrollEl && !board.container.contains(col.containerEl)) {
+          const style = scrollEl.ownerDocument?.defaultView?.getComputedStyle?.(scrollEl);
+          const offset = (measurements.pad?.start || 0) + colIndex * (measurements.columnWidth + measurements.columnGap);
+          scrollEl.scrollLeft = style?.direction === "rtl" ? -offset : offset;
+          board.subView.updateVirtualDisplay?.();
+        }
+        const rowIndex = col.group.entries.findIndex(entry => entry.file?.path === cardPath);
+        if (rowIndex >= 0 && col.contentEl) {
+          col.contentEl.scrollTop = rowIndex * (measurements.cardHeight + measurements.cardGap);
+          col.readViewport?.();
+          col.updateVirtualDisplay?.();
+        }
+      }
+      const el = rendered(col);
+      if (!el) continue;
+      el.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+      el.focus?.({ preventScroll: true });
+      return true;
+    }
+    if (boards.length) await workspace.revealLeaf?.(boards[0].leaf);
+    await workspace.openLinkText?.(cardPath, "", true);
+    return false;
+  }
+
   orderedCanvasLeaves(hint) {
     const leaves = this.app.workspace.getLeavesOfType("canvas");
     const preferred = hint?.canvas && leaves.find(leaf => leaf.view.canvas === hint.canvas);
@@ -1533,6 +2219,130 @@ module.exports = class BridgeChatPlugin extends Plugin {
     return Object.fromEntries(entries);
   }
 
+  async withKanbanFiles(files, write) {
+    if (files.some(file => this.writingKanbanFiles.has(file.path))) {
+      throw new Error("有看板卡片正在更新，请稍后重试。");
+    }
+    for (const file of files) this.writingKanbanFiles.add(file.path);
+    try {
+      return await write();
+    } finally {
+      for (const file of files) this.writingKanbanFiles.delete(file.path);
+      this.scheduleKanbanSync();
+    }
+  }
+
+  kanbanFiles(cardPaths) {
+    return [...new Set(cardPaths)].map(path => this.app.vault.getFileByPath(path))
+      .filter(file => file?.extension?.toLowerCase() === "md");
+  }
+
+  async updateKanbanCardStatus(cardPaths, nextStatus, statusProperty = "status", { when = () => true } = {}) {
+    const property = this.kanbanContext.stripNotePrefix(statusProperty);
+    if (!this.kanbanContext.isKanbanProperty(property) || typeof nextStatus !== "string" || !nextStatus.trim()) {
+      throw new Error("看板状态或属性无效。");
+    }
+    const files = this.kanbanFiles(cardPaths);
+    let updated = 0;
+    const unchanged = Symbol("unchanged Kanban status");
+    return this.withKanbanFiles(files, async () => {
+      for (const file of files) {
+        try {
+          await this.app.fileManager.processFrontMatter(file, fm => {
+            // Obsidian serializes frontmatter even when the callback makes no edits.
+            if (fm[property] === nextStatus || !when(fm[property])) throw unchanged;
+            fm[property] = nextStatus;
+            if (property !== "updated" && Object.hasOwn(fm, "updated")) fm.updated = this.kanbanContext.todayLocalYmd();
+          });
+          updated++;
+        } catch (error) {
+          if (error !== unchanged) throw error;
+        }
+      }
+      return { updated, skipped: new Set(cardPaths).size - updated };
+    });
+  }
+
+  async applyKanbanReplyPatch(key, { boardPath, cardPaths, statusProperty = "status", statusOptions }, patch) {
+    if (Object.hasOwn(this.appliedPatches, key)) return null;
+    if (this.applyingKanbanPatches.has(key)) throw new Error("这条看板补丁正在处理，请稍后重试。");
+    const kanban = this.ensureKanbanContext();
+    const property = kanban.stripNotePrefix(statusProperty);
+    if (!kanban.isKanbanProperty(property)) throw new Error("看板状态属性无效。");
+    const { operations, summary } = kanban.validateKanbanPatch(patch, {
+      allowedCardPaths: Array.isArray(cardPaths) ? cardPaths : [], statusOptions, statusProperty: property,
+    });
+    const byPath = new Map();
+    for (const operation of operations) {
+      if (!byPath.has(operation.file)) byPath.set(operation.file, []);
+      byPath.get(operation.file).push(operation);
+    }
+    const { vault } = this.app;
+    const files = this.kanbanFiles(byPath.keys());
+    const undo = [];
+    this.applyingKanbanPatches.add(key);
+    try {
+      return await this.withKanbanFiles(files, async () => {
+        try {
+          for (const file of files) {
+            const updates = byPath.get(file.path);
+            const hasProperties = updates.some(update => update.status || update.properties);
+            let entry;
+            await vault.process(file, before => {
+              const text = hasProperties ? updateKanbanFrontmatter(before, updates, property, kanban.todayLocalYmd()) : before;
+              const after = updates.reduce(kanban.applyKanbanBodyEdits, text);
+              entry = { path: file.path, before, after };
+              return after;
+            });
+            if (entry.before !== entry.after) undo.push(entry);
+          }
+        } finally {
+          if (undo.length) {
+            this.appliedPatches[key] = {
+              kind: "kanban", boardPath, undo,
+              rawContentBackup: Object.fromEntries(undo.map(entry => [entry.path, entry.before])),
+              appliedAt: new Date().toISOString(),
+            };
+            this.app.saveLocalStorage(APPLIED, this.appliedPatches);
+          }
+        }
+        const updated = undo.length;
+        return { updated, skipped: summary.skipped + byPath.size - updated };
+      });
+    } finally {
+      this.applyingKanbanPatches.delete(key);
+    }
+  }
+
+  async revertKanbanReplyPatch(key) {
+    const record = this.appliedPatches[key];
+    if (record?.kind !== "kanban" || !record.undo?.length) throw new Error("这条看板补丁没有可撤销的快照。");
+    const { vault } = this.app;
+    const files = new Map(this.kanbanFiles(record.undo.map(entry => entry.path)).map(file => [file.path, file]));
+    const remaining = new Set(record.undo);
+    return this.withKanbanFiles([...files.values()], async () => {
+      for (const entry of record.undo) {
+        const file = files.get(entry.path);
+        if (!file) throw new Error(`找不到看板卡片 ${entry.path}。`);
+        if (await vault.read(file) !== entry.after) throw new Error(`卡片在应用补丁后已编辑 · ${entry.path}`);
+      }
+      try {
+        for (const entry of record.undo) {
+          await vault.process(files.get(entry.path), text => {
+            if (text !== entry.after) throw new Error(`卡片在应用补丁后已编辑 · ${entry.path}`);
+            return entry.before;
+          });
+          remaining.delete(entry);
+        }
+        return { restored: record.undo.length };
+      } finally {
+        if (!remaining.size) delete this.appliedPatches[key];
+        else this.appliedPatches[key] = { ...record, undo: [...remaining] };
+        this.app.saveLocalStorage(APPLIED, this.appliedPatches);
+      }
+    });
+  }
+
   async applyReplyPatch(key, { canvasPath, selectedIds }, patch) {
     if (Object.hasOwn(this.appliedPatches, key)) return null;
     const file = this.app.vault.getFileByPath(canvasPath);
@@ -1562,6 +2372,7 @@ module.exports = class BridgeChatPlugin extends Plugin {
   }
 
   async revertReplyPatch(key) {
+    if (this.appliedPatches[key]?.kind === "kanban") return this.revertKanbanReplyPatch(key);
     if (!this.ensureCanvasContext()) {
       throw new Error(this.canvasLoadError ? `Canvas 协作模块加载失败：${this.canvasLoadError}` : "Canvas 协作模块尚未加载。");
     }

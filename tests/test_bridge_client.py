@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from io import StringIO
 import json
 import os
 import re
@@ -87,6 +88,20 @@ class BridgeClientTests(unittest.TestCase):
             job_id = self.dispatch()["job_id"]
         return self.directory / f"job_{job_id}.json"
 
+    def make_blocked_job(self, **fields):
+        file = self.make_job()
+        job = self.bridge._read_json_safe(file)
+        job.update({"status": "blocked", "error": "old error", "reply": "partial reply",
+                    "replyTime": "2026-01-02T00:00:00Z", "dispatch_id": "old-dispatch",
+                    "observed_model": "old-model", **fields})
+        bridge_client.write_job(file, job)
+        return file, job
+
+    def rerun(self, job_id, **fields):
+        return bridge_client.rerun_codex(self.bridge, self.server, self.workspace, {
+            "job_id": job_id, "token": "retry-1", **fields,
+        })
+
     def test_model_prefix_guard_rejects_unprefixed_and_empty_models(self):
         self.assertFalse(bridge_client.is_allowed_model(""))
         self.assertTrue(bridge_client.is_allowed_model("bare-model"))
@@ -135,6 +150,146 @@ class BridgeClientTests(unittest.TestCase):
         self.assertEqual(first, second)
         popen.assert_called_once()
 
+    def test_kanban_dispatch_persists_board_and_locked_cards_across_rerun(self):
+        paths = ["Tasks/A.md", "Tasks/B.md"]
+        with patch.object(subprocess, "Popen"):
+            result = self.dispatch(board_path="Boards/Tasks.base", card_paths=paths, canvas_path="", selected_ids=[],
+                                   mode="execute_task", text="# Kanban 协作任务")
+            job_id = result["job_id"]
+            job = self.read_job(job_id)
+            self.assertEqual(job["board_path"], "Boards/Tasks.base")
+            self.assertEqual(job["card_paths"], paths)
+            self.assertEqual(bridge_client.codex_task(job)["boardPath"], "Boards/Tasks.base")
+            self.assertEqual(bridge_client.codex_task(job)["cardPaths"], paths)
+            file = self.directory / f"job_{job_id}.json"
+            bridge_client.write_job(file, {**job, "status": "blocked"})
+            self.assertTrue(self.rerun(job_id)["ok"])
+        rerun = self.read_job(job_id)
+        self.assertEqual(rerun["board_path"], job["board_path"])
+        self.assertEqual(rerun["card_paths"], job["card_paths"])
+        self.assertEqual(rerun["prompt"], job["prompt"])
+
+    def test_worker_chooses_kanban_canvas_or_empty_writeback_constraint(self):
+        kanban = "遵循指令中的 Kanban 回写契约，在回复末尾输出 kanban-patch 代码块，由用户在 Obsidian 中应用状态与进展更新。"
+        canvas = "遵循指令中的 Canvas 回写契约，由用户在 Obsidian 中应用补丁。"
+        file = self.make_job()
+        stored = self.bridge._read_json_safe(file)
+        old = {key: value for key, value in stored.items() if key not in ("board_path", "card_paths", "canvas_path")}
+        execution = {"status": "completed", "result": "完成"}
+        with patch.object(bridge_client, "execution_result", return_value=execution):
+            for fields, constraint in [({"canvas_path": "Board.canvas"}, canvas), ({}, ""),
+                                       ({"board_path": "Board.base", "canvas_path": "Board.canvas"}, kanban),
+                                       ({"card_paths": ["Tasks/A.md"]}, kanban)]:
+                with self.subTest(fields=fields):
+                    bridge_client.execute_codex_job(self.bridge, file, {**old, **fields})
+                    self.assertEqual(self.bridge.tool_dispatch_task.call_args.kwargs["constraints"], constraint)
+        self.assertEqual(bridge_client.codex_task(old)["boardPath"], "")
+        self.assertEqual(bridge_client.codex_task(old)["cardPaths"], [])
+
+    def test_rerun_codex_updates_original_job_and_is_idempotent(self):
+        file, job = self.make_blocked_job(requested_model="provider/codex/historical", requested_effort="low")
+        job_id = job["job_id"]
+        payload = {"action": "rerun_codex", "workspace": str(self.workspace), "job_id": job_id, "token": "retry-1"}
+        self.server.touch()
+
+        def launch(command, **_kwargs):
+            self.assertEqual(command, [sys.executable, "-I", "-B", "-X", "utf8",
+                                       str(Path(bridge_client.__file__).resolve()), "--codex-worker",
+                                       str(self.server.resolve()), str(file)])
+            self.assertEqual(self.read_job(job_id)["status"], "running")
+
+        with (patch.object(subprocess, "Popen", side_effect=launch) as popen,
+              patch.object(bridge_client, "load_bridge", return_value=self.bridge),
+              patch.object(sys, "argv", ["bridge_client.py", str(self.server)]),
+              patch.object(sys, "stdin", StringIO(json.dumps(payload)))):
+            self.assertEqual(bridge_client.main(), {"ok": True, "job_id": job_id})
+            self.assertEqual(self.rerun(job_id), {"ok": True, "job_id": job_id})
+            self.assertEqual(self.rerun(job_id, token="retry-2"), {
+                "ok": False, "error": "该任务正在执行中，请勿重复重跑。",
+            })
+        popen.assert_called_once()
+        updated = self.read_job(job_id)
+        self.assertTrue(updated["rerun_at"])
+        self.assertEqual(updated, {**job, "status": "running", "error": "", "reply": "", "replyTime": "",
+                                   "dispatch_id": "", "observed_model": "", "retry_count": 1,
+                                   "rerun_token": "retry-1", "rerun_at": updated["rerun_at"]})
+        self.assertEqual(list(self.directory.glob("job_*.json")), [file])
+
+        bridge_client.write_job(self.bridge._execution_path("dispatch"), {
+            "status": "completed", "raw_reply": "重跑完成", "completed_at": "2026-01-03T00:00:00Z",
+        })
+        with patch.object(bridge_client, "load_bridge", return_value=self.bridge):
+            bridge_client.codex_worker(self.server, file)
+        replied = self.read_job(job_id)
+        self.assertEqual((replied["job_id"], replied["status"], replied["reply"]), (job_id, "replied", "重跑完成"))
+        self.assertEqual(replied["submitted_at"], job["submitted_at"])
+        self.assertEqual(list(self.directory.glob("job_*.json")), [file])
+        self.assertEqual(self.rerun(job_id), {"ok": True, "job_id": job_id})
+        self.assertEqual(self.rerun(job_id, token="retry-2"), {"ok": False, "error": "仅受阻任务支持重跑。"})
+
+    def test_rerun_codex_validates_id_token_record_and_workspace(self):
+        file, job = self.make_blocked_job(rerun_token="retry-1")
+        job_id = job["job_id"]
+        with patch.object(subprocess, "Popen") as popen:
+            for invalid in ("", "../job", "..", "foo/bar", "foo\\bar", "a" * 65):
+                with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "无效的 Codex 任务编号"):
+                    self.rerun(invalid)
+            with self.assertRaisesRegex(ValueError, "缺少幂等 token"):
+                self.rerun(job_id, token=" \t")
+            missing = {"ok": False, "error": "找不到可重跑的 Codex 任务记录。"}
+            self.assertEqual(self.rerun("missing"), missing)
+            for invalid_record in ([], {**job, "job_id": "other"}, {**job, "workspace": str(self.workspace / "other")},
+                                   {**job, "workspace": 123}):
+                with self.subTest(record=invalid_record):
+                    bridge_client.write_job(file, invalid_record)
+                    self.assertEqual(self.rerun(job_id), missing)
+                    self.assertEqual(self.bridge._read_json_safe(file), invalid_record)
+        popen.assert_not_called()
+
+    def test_rerun_codex_validates_model_and_target_before_updating_job(self):
+        file, job = self.make_blocked_job(requested_model="unprefixed")
+        job_id = job["job_id"]
+        alternate_model = "provider/codex/alternate"
+        with (patch.dict(os.environ, {bridge_client.REQUIRED_MODEL_PREFIX_ENV: "provider/"}),
+              patch.object(bridge_client, "codex_models_catalog", return_value=([{"id": alternate_model}], "test")),
+              patch.object(subprocess, "Popen") as popen):
+            self.assertEqual(self.rerun(job_id), {"ok": False, "error": bridge_client.model_guard_error("provider/")})
+            self.assertEqual(self.rerun(job_id, model="provider/codex/unknown"), {
+                "ok": False, "error": "所选 Codex 模型不可用：provider/codex/unknown",
+            })
+            self.assertEqual(self.read_job(job_id), job)
+            for target in ("relative", str(self.workspace / "missing")):
+                with self.subTest(target=target):
+                    bad_target = {**job, "target_workspace": target}
+                    bridge_client.write_job(file, bad_target)
+                    self.assertEqual(self.rerun(job_id, model=alternate_model), {
+                        "ok": False, "error": "目标工作目录必须是已存在的本地绝对路径。",
+                    })
+                    self.assertEqual(self.read_job(job_id), bad_target)
+            popen.assert_not_called()
+            bridge_client.write_job(file, {**job, "target_workspace": "", "status": "notification_failed"})
+            self.assertEqual(self.rerun(job_id, model=alternate_model, effort="xhigh"), {"ok": True, "job_id": job_id})
+        popen.assert_called_once()
+        updated = self.read_job(job_id)
+        self.assertEqual((updated["requested_model"], updated["requested_effort"], updated["model_selected"]),
+                         (alternate_model, "xhigh", True))
+        bridge_client.acquire_codex_binding(self.bridge, updated, alternate_model, "xhigh", "fast")
+        self.assertEqual(self.bridge.tool_bind_session.call_args.kwargs["workspace_path"], str(self.workspace))
+
+    def test_rerun_codex_restores_blocked_status_when_worker_does_not_start(self):
+        file, job = self.make_blocked_job(requested_model="", requested_effort="", retry_count=2)
+        job_id = job["job_id"]
+        with patch.object(subprocess, "Popen", side_effect=OSError("start failed")) as popen:
+            result = self.rerun(job_id)
+        popen.assert_called_once()
+        self.assertEqual(result, {"ok": False, "error": "无法启动 Codex 后台任务：start failed"})
+        updated = self.read_job(job_id)
+        self.assertEqual((updated["status"], updated["error"], updated["retry_count"]), ("blocked", result["error"], 3))
+        self.assertEqual((updated["job_id"], updated["submitted_at"]), (job_id, job["submitted_at"]))
+        self.assertEqual((updated["requested_model"], updated["requested_effort"]), (MODEL, "high"))
+        self.assertNotEqual(updated["replyTime"], job["replyTime"])
+        self.assertEqual(list(self.directory.glob("job_*.json")), [file])
+
     def test_existing_agy_send_still_reuses_the_original_request(self):
         self.bridge.route = {"project_id": "project", "conversation_id": "conversation"}
         token = str(uuid.uuid4())
@@ -153,6 +308,111 @@ class BridgeClientTests(unittest.TestCase):
                 bridge_client.send(self.bridge, self.server, self.workspace, {**payload, "text": "已修改"})
         submit.assert_not_called()
 
+    def make_agy_replacement(self):
+        self.bridge.route = {"project_id": "project", "conversation_id": "conversation"}
+        request = self.workspace / "requests" / "req_1.json"
+        delivery = self.workspace / "deliveries" / request.name
+        request.parent.mkdir()
+        delivery.parent.mkdir()
+        item = {
+            "request_id": "req_1", "workspace_path": str(self.workspace),
+            "target_project_id": "project", "target_conversation_id": "conversation",
+            "self_check": bridge_client.SOURCE_PREFIX + str(uuid.uuid4()),
+        }
+        bridge_client.write_job(request, item)
+        bridge_client.write_job(delivery, {"status": "notification_failed"})
+        payload = {"token": str(uuid.uuid4()), "text": "重跑", "project": "project",
+                   "conversation": "conversation", "replace_request_id": "req_1"}
+        return request, delivery, item, payload
+
+    def test_agy_replacement_removes_old_unreplied_request_only_after_enqueue(self):
+        request, delivery, item, payload = self.make_agy_replacement()
+        new_request = request.with_name("req_2.json")
+        subdirectory = self.workspace / "subdirectory"
+        subdirectory.mkdir()
+        bridge_client.write_job(request, {**item, "workspace_path": str(subdirectory)})
+
+        def submit_ok(_server, workspace, text, marker):
+            self.assertTrue(request.exists())
+            self.assertTrue(delivery.exists())
+            bridge_client.write_job(new_request, {**item, "request_id": "req_2", "workspace_path": str(workspace),
+                                                  "step_summary": text, "self_check": marker})
+            return {"ok": True, "request_id": "req_2"}
+
+        with patch.object(bridge_client, "submit_mcp", side_effect=submit_ok) as submit:
+            expected = {"ok": True, "request_id": "req_2"}
+            self.assertEqual(bridge_client.send(self.bridge, self.server, self.workspace, payload), expected)
+            self.assertEqual(bridge_client.send(self.bridge, self.server, self.workspace, payload), expected)
+        submit.assert_called_once()
+        self.assertFalse(request.exists())
+        self.assertFalse(delivery.exists())
+        self.assertTrue(new_request.exists())
+
+    def test_agy_replacement_preserves_out_of_scope_and_replied_requests(self):
+        request, delivery, item, payload = self.make_agy_replacement()
+        result = {"ok": True, "request_id": "req_2"}
+        with patch.object(bridge_client, "submit_mcp", return_value=result):
+            for override in ({"self_check": "Codex"}, {"target_project_id": "other"},
+                             {"target_conversation_id": "other"}, {"request_id": "req_3"},
+                             {"workspace_path": str(self.workspace.with_name("other"))},
+                             {"workspace_path": str(self.workspace / ".." / "other")}, {"status": "replied"}):
+                with self.subTest(override=override):
+                    bridge_client.write_job(request, {**item, **override})
+                    self.assertEqual(bridge_client.send(self.bridge, self.server, self.workspace, payload), result)
+                    self.assertTrue(request.exists())
+                    self.assertTrue(delivery.exists())
+            bridge_client.write_job(request, ["invalid record"])
+            self.assertEqual(bridge_client.send(self.bridge, self.server, self.workspace, payload), result)
+            self.assertTrue(request.exists())
+
+            bridge_client.write_job(request, item)
+            self.bridge.codex_tool_fetch_director_reply.return_value = {"replied_at": "2026-01-02T00:00:00Z"}
+            self.assertEqual(bridge_client.send(self.bridge, self.server, self.workspace, payload), result)
+            self.assertTrue(request.exists())
+            self.assertTrue(delivery.exists())
+
+        reply = self.workspace / "replies" / request.name
+        reply.parent.mkdir()
+        self.bridge.codex_tool_fetch_director_reply.reset_mock(return_value=True)
+
+        def reply_during_submit(*_args):
+            bridge_client.write_job(reply, {"request_id": "req_1"})
+            return result
+
+        with patch.object(bridge_client, "submit_mcp", side_effect=reply_during_submit):
+            self.assertEqual(bridge_client.send(self.bridge, self.server, self.workspace, payload), result)
+        self.bridge.codex_tool_fetch_director_reply.assert_not_called()
+        self.assertTrue(reply.exists())
+        self.assertTrue(request.exists())
+        self.assertTrue(delivery.exists())
+
+    def test_agy_replacement_preserves_old_request_on_failed_enqueue_and_accepts_cleanup_failure(self):
+        request, delivery, _item, payload = self.make_agy_replacement()
+        for failure in ({"ok": False, "message": "enqueue failed"}, {"ok": True, "request_id": "../invalid"},
+                        {"ok": True, "request_id": None}):
+            with (self.subTest(failure=failure), patch.object(bridge_client, "submit_mcp", return_value=failure),
+                  self.assertRaises(RuntimeError)):
+                bridge_client.send(self.bridge, self.server, self.workspace, payload)
+            self.assertTrue(request.exists())
+            self.assertTrue(delivery.exists())
+        same = {"ok": True, "request_id": "req_1"}
+        with patch.object(bridge_client, "submit_mcp", return_value=same):
+            self.assertEqual(bridge_client.send(self.bridge, self.server, self.workspace, payload), same)
+        self.assertTrue(request.exists())
+        self.assertTrue(delivery.exists())
+        result = {"ok": True, "request_id": "req_2"}
+        with patch.object(bridge_client, "submit_mcp", return_value=result):
+            invalid = {**payload, "replace_request_id": "../requests/req_1"}
+            self.assertEqual(bridge_client.send(self.bridge, self.server, self.workspace, invalid), result)
+        self.assertTrue(request.exists())
+        self.assertTrue(delivery.exists())
+        with (patch.object(bridge_client, "submit_mcp", return_value=result),
+              patch.object(Path, "unlink", side_effect=PermissionError("file is in use")) as unlink):
+            self.assertEqual(bridge_client.send(self.bridge, self.server, self.workspace, payload), result)
+        unlink.assert_called_once_with(missing_ok=True)
+        self.assertTrue(request.exists())
+        self.assertTrue(delivery.exists())
+
     def test_invalid_target_and_worker_start_failure(self):
         with patch.object(subprocess, "Popen", side_effect=OSError("start failed")) as popen:
             self.assertFalse(self.dispatch(target_workspace=str(self.workspace / "missing"))["ok"])
@@ -170,6 +430,7 @@ class BridgeClientTests(unittest.TestCase):
                 "submitted_at": "2026-01-01T00:00:00-08:00", "reply": "完成", "prompt": "任务",
                 "mode": "execute_task", "canvas_path": "Board.canvas", "selected_ids": ["node"],
                 "target_workspace": str(workspace), "observed_model": MODEL,
+                "requested_effort": "high", "step_goal": "保留原始步骤",
             })
         self.bridge.route = {"project_id": "project", "conversation_id": "conversation"}
         requests = self.workspace / "requests"
@@ -192,6 +453,13 @@ class BridgeClientTests(unittest.TestCase):
         self.assertEqual(len(result["tasks"]), 1)
         self.assertEqual(result["tasks"][0]["selectedIds"], ["node"])
         self.assertEqual(result["tasks"][0]["model"], MODEL)
+        self.assertEqual(result["tasks"][0]["effort"], "high")
+        self.assertEqual(result["tasks"][0]["stepGoal"], "保留原始步骤")
+
+    def test_codex_task_defaults_rerun_metadata_for_older_jobs(self):
+        task = bridge_client.codex_task({"job_id": "older", "status": "blocked"})
+        self.assertEqual(task["effort"], "")
+        self.assertEqual(task["stepGoal"], "")
 
     def test_worker_polls_for_execution_and_records_reply(self):
         file = self.make_job()

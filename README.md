@@ -1,6 +1,6 @@
 # Canvas Bridge (`obsidian-canvas-bridge`)
 
-Canvas Bridge is an Obsidian desktop sidebar plugin that captures Canvas selections, linked note excerpts, and upstream/downstream edges. It sends tasks to OpenAI-compatible APIs, custom providers, or an optional Antigravity/Codex bridge, then renders Markdown replies and previews, applies, and reverts `canvas-patch` edits in Obsidian.
+Canvas Bridge is an Obsidian desktop sidebar plugin that captures Canvas selections (with linked note excerpts and upstream/downstream edges) as well as Obsidian Bases Kanban cards. It sends tasks to OpenAI-compatible APIs, custom providers, or an optional Antigravity/Codex bridge, then renders Markdown replies and previews, applies, and safely reverts `canvas-patch` and `kanban-patch` edits in Obsidian.
 
 ![Canvas Bridge Workspace](docs/images/hero-canvas-workflow.png)
 
@@ -15,6 +15,24 @@ Canvas Bridge is an Obsidian desktop sidebar plugin that captures Canvas selecti
 ![Patch Preview and Safe Apply](docs/images/patch-preview-and-apply.png)
 
 - **Provider & Model Picker**: Switch between enabled providers in the sidebar. Model, reasoning effort, and target repository controls follow the selected provider's capabilities.
+
+- **Bases Kanban Dispatch & Status Sync**: Capture Kanban cards directly from Obsidian Bases boards, dispatch tasks with `repo:` detection, update card statuses from the sidebar or on dispatch, and preview/apply/revert `kanban-patch` updates. See [Bases Kanban](#bases-kanban) below.
+
+- **One-Click Task Rerun**: Retry `blocked` or `notification_failed` tasks directly from task history across Codex, AGY, OpenAI-compatible HTTP endpoints, and custom providers while preserving the original prompt, scope, and idempotency tokens.
+
+## Bases Kanban
+
+- **Card Capture & Dispatch**:
+  - Open any Bases Kanban view and click **派活** on a Markdown card (or **Alt+click** the card) to load it into the sidebar without triggering card drag or leaving the board. Hold **Shift** or **Ctrl/Cmd** when capturing to append multiple cards from the same board.
+  - Use the card file context menu (**抓取卡片到协作对话**, plus **用 Codex 派活** / **用 AGY 派活** when the bridge is enabled) or the command palette (**抓取当前看板卡片到协作对话**).
+  - Click **按卡派活** to dispatch immediately using the default task prompt when the instruction box is empty; `repo:` frontmatter/note paths are detected automatically as the target repository.
+- **Status Updates**:
+  - Use **更新看板状态** in the composer or the quick-status buttons under recent Kanban tasks to update card frontmatter directly.
+  - The **派活后更新为进行中** checkbox (enabled by default) automatically advances initial-column cards (e.g. `待办` / `todo`) to `进行中` once dispatch is accepted.
+  - Boards grouped by week or stream automatically resolve the canonical status property and column order from the sibling status-grouped view in the same `.base` file.
+- **Reply Writeback & Safe Undo**:
+  - Replies containing a `kanban-patch` block render visual diff cards and let you click **应用到看板** to update status, frontmatter properties, `## 实时进展与记录`, and task checkboxes—strictly scoped to the locked cards from dispatch.
+  - Click **撤销应用** to restore the exact pre-patch Markdown, guarded against overwriting later manual edits.
 
 ## Prerequisites
 
@@ -35,9 +53,9 @@ The HTTP provider uses Obsidian's HTTP API and needs no extra packages or Python
 1. Open **Settings → Canvas Bridge**. Enable the **OpenAI API** profile or add another profile.
 2. Set **Base URL** to the API root, for example `https://api.openai.com/v1`, or use a full `/chat/completions` URL. For a local compatible server such as Ollama, LM Studio, or vLLM, use the address exposed by that server and leave **API Key** blank if it accepts unauthenticated requests.
 3. Enter model IDs separated by commas or newlines. Fill in the optional system prompt and click **测试连接** to check the corresponding `/models` endpoint.
-4. Open the sidebar, choose the provider and model, and send an instruction. Capture a Canvas selection to include its nodes, edges, and linked note excerpts in the request. Review the generated patch before applying it.
+4. Open the sidebar, choose the provider and model, and send an instruction. Capture a Canvas selection or Bases Kanban card to include its context in the request, then review the generated `canvas-patch` or `kanban-patch` before applying it.
 
-The API key is saved in the plugin's gitignored `data.json`. The configured endpoint receives your instruction and any captured Canvas content included in the prompt. Recent HTTP tasks are saved locally per Vault.
+The API key is saved in the plugin's gitignored `data.json`. The configured endpoint receives your instruction and any captured Canvas or Kanban content included in the prompt. Recent HTTP tasks are saved locally per Vault.
 
 ## Optional Codex-Antigravity-Bridge
 
@@ -45,7 +63,7 @@ Install `Codex-Antigravity-Bridge` with Python 3.11+ and register `chatgpt-bridg
 
 ## Register a custom provider
 
-From another plugin, call `registerProvider(adapter)` on the loaded Canvas Bridge plugin instance. Use a unique lowercase slug for `id`. `getStatus` and `listTasks` receive the Vault workspace path and may return a value or a promise. Return `{ ready: true }` when the provider can accept requests and `{ available: false }` to hide it. You can also report `models`, `defaultModel`, or `efforts` to populate the corresponding controls. `dispatch` receives the assembled `prompt` and metadata including `workspace`, `targetWorkspace`, `executor`, `mode`, `canvasPath`, `selectedIds`, `model`, and the idempotency `token`. Persist or deduplicate tokens in the adapter if it needs safe retries.
+From another plugin, call `registerProvider(adapter)` on the loaded Canvas Bridge plugin instance. Use a unique lowercase slug for `id`. `getStatus` and `listTasks` receive the Vault workspace path and may return a value or a promise. Return `{ ready: true }` when the provider can accept requests and `{ available: false }` to hide it. You can also report `models`, `defaultModel`, or `efforts` to populate the corresponding controls. `dispatch` receives the assembled `prompt` and metadata including `workspace`, `targetWorkspace`, `executor`, `mode`, `canvasPath`, `selectedIds`, `model`, `effort`, optional `rerunId`, and the idempotency `token`. Persist or deduplicate tokens in the adapter if it needs safe retries and reruns.
 
 ```js
 const tasks = [];
@@ -78,7 +96,7 @@ For background work, return `{ ok: true, id, settled }` with `settled` as a comp
 ## Running Tests
 
 ```powershell
-node --test tests/canvas_context.test.js tests/providers.test.js tests/main.test.js
+node --test tests/canvas_context.test.js tests/kanban_context.test.js tests/providers.test.js tests/main.test.js
 python -m unittest discover -s tests -t . -p "test_*.py" -v
 ```
 

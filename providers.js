@@ -107,9 +107,10 @@ class LocalTaskStore {
     return (this.data.get(workspace) || []).filter(task => !executor || task.executor === executor).map(taskShape);
   }
 
-  findByToken(workspace, executor, token) {
+  findByToken(workspace, executor, token, { rerunOnly = false } = {}) {
     if (!token) return undefined;
-    const task = this.data.get(workspace)?.find(task => task.executor === executor && task.token === token);
+    const task = this.data.get(workspace)?.find(task => task.executor === executor
+      && (task.rerunToken === token || (!rerunOnly && task.token === token)));
     return task && taskShape(task);
   }
 
@@ -136,13 +137,13 @@ class LocalTaskStore {
     const current = tasks[index];
     const updated = taskShape({ ...current, ...patch, id: current.id, executor: current.executor, time: current.time });
     const next = tasks.slice();
-    next[index] = { ...updated, token: current.token };
+    next[index] = { ...updated, token: current.token, rerunToken: patch.rerunToken ?? current.rerunToken };
     try {
       this.persist(workspace, next);
       return taskShape(updated);
     } catch {
       const blocked = { ...updated, status: "blocked", error: "Unable to save the completed task to local storage." };
-      next[index] = { ...blocked, token: current.token };
+      next[index] = { ...blocked, token: current.token, rerunToken: current.rerunToken };
       this.data.set(workspace, next);
       return taskShape(blocked);
     }
@@ -225,16 +226,7 @@ function createOpenAICompatibleProvider(config, { store = new LocalTaskStore(), 
     return redact(await readResponse(response, extractChatCompletionReply));
   }
 
-  function dispatch(options = {}) {
-    const workspace = options.workspace || options.targetWorkspace || "default";
-    const existing = store.findByToken(workspace, id, options.token);
-    if (existing) return { ok: true, id: existing.id, settled: pending.get(existing.id) || Promise.resolve(existing) };
-    const task = store.create(workspace, {
-      executor: id, providerLabel: label, mode: options.mode || "edit_canvas", canvasPath: options.canvasPath,
-      selectedIds: options.selectedIds, targetWorkspace: options.targetWorkspace || workspace, status: "running",
-      prompt: options.prompt ?? options.text ?? "", model: options.model || defaultModel,
-      source: options.source || "Obsidian", token: options.token,
-    });
+  function start(workspace, task, options) {
     const settled = Promise.resolve().then(async () => {
       let patch;
       try { patch = { status: "replied", reply: await complete(task, options) }; }
@@ -250,6 +242,37 @@ function createOpenAICompatibleProvider(config, { store = new LocalTaskStore(), 
     pending.set(task.id, settled);
     emit(task);
     return { ok: true, id: task.id, settled };
+  }
+
+  function dispatch(options = {}) {
+    const workspace = options.workspace || options.targetWorkspace || "default";
+    const existing = store.findByToken(workspace, id, options.token);
+    if (typeof options.rerunId === "string" && options.rerunId) {
+      const original = store.list(workspace, id).find(task => task.id === options.rerunId);
+      if (!original) return { ok: false, error: "找不到可重跑的任务记录。" };
+      if (pending.has(original.id)) return { ok: true, id: original.id, settled: pending.get(original.id) };
+      if (original.status === "running") return { ok: false, error: "该任务正在执行中。" };
+      if (existing && existing.id !== original.id) return { ok: false, error: "该请求 token 已用于其他任务。" };
+      if (existing && store.findByToken(workspace, id, options.token, { rerunOnly: true })) {
+        return { ok: true, id: original.id, settled: Promise.resolve(existing) };
+      }
+      const task = store.update(workspace, original.id, {
+        status: "running", reply: "", replyTime: "", error: "",
+        ...(options.model ? { model: options.model } : {}),
+        ...(options.prompt != null ? { prompt: options.prompt } : {}),
+        ...(options.token ? { rerunToken: options.token } : {}),
+      }, id);
+      if (task?.status !== "running") return { ok: false, error: task?.error || "找不到可重跑的任务记录。" };
+      return start(workspace, task, options);
+    }
+    if (existing) return { ok: true, id: existing.id, settled: pending.get(existing.id) || Promise.resolve(existing) };
+    const task = store.create(workspace, {
+      executor: id, providerLabel: label, mode: options.mode || "edit_canvas", canvasPath: options.canvasPath,
+      selectedIds: options.selectedIds, targetWorkspace: options.targetWorkspace || workspace, status: "running",
+      prompt: options.prompt ?? options.text ?? "", model: options.model || defaultModel,
+      source: options.source || "Obsidian", token: options.token,
+    });
+    return start(workspace, task, options);
   }
 
   return {

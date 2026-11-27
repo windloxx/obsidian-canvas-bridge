@@ -158,6 +158,58 @@ test("queues a Canvas prompt immediately, sends system and user messages, and st
   assert.equal(calls.length, 1);
 });
 
+test("reruns a blocked task in place and deduplicates the pending request and its tokens", async () => {
+  let saved;
+  const persistence = { load: () => saved, save: value => { saved = JSON.parse(JSON.stringify(value)); } };
+  const store = new LocalTaskStore(persistence);
+  const requests = [];
+  const notifications = [];
+  let finish;
+  const provider = createOpenAICompatibleProvider(config(), {
+    store,
+    notify: task => notifications.push([task.id, task.status]),
+    requestFn: request => { requests.push(request); return new Promise(resolve => { finish = resolve; }); },
+  });
+  const workspace = "vault";
+  const original = store.create(workspace, {
+    executor: provider.id, status: "blocked", token: "original", model: "gpt-4.1-mini", prompt: "original prompt",
+    time: "2026-01-01T00:00:00Z", replyTime: "2026-01-02T00:00:00Z", error: "Failed", reply: "Partial reply",
+    canvasPath: "Board.canvas", selectedIds: ["node"],
+  });
+  const options = { workspace, rerunId: original.id, token: "retry", model: "gpt-4.1", prompt: "updated prompt" };
+  const result = provider.dispatch(options);
+  assert.equal(result.ok, true);
+  assert.equal(result.id, original.id);
+  const running = { ...original, status: "running", error: "", reply: "", replyTime: "", model: options.model, prompt: options.prompt };
+  assert.deepEqual(provider.listTasks(workspace), [running]);
+  for (const retry of [options, { ...options, token: "another-retry" }, { workspace, token: "original" }, { workspace, token: "retry" }]) {
+    assert.deepEqual(provider.dispatch(retry), result);
+  }
+  const anotherProvider = createOpenAICompatibleProvider(config(), { store, requestFn: () => assert.fail("unexpected request") });
+  assert.deepEqual(anotherProvider.dispatch(options), { ok: false, error: "该任务正在执行中。" });
+  assert.equal(provider.dispatch({ ...options, workspace: "other-vault" }).ok, false);
+  assert.deepEqual(provider.listTasks("other-vault"), []);
+  await Promise.resolve();
+  assert.equal(requests.length, 1);
+  assert.deepEqual(JSON.parse(requests[0].body), {
+    model: options.model, messages: [{ role: "user", content: options.prompt }],
+  });
+  finish({ status: 200, json: jsonReply("Done") });
+  const replied = await result.settled;
+  assert.ok(Date.parse(replied.replyTime));
+  assert.deepEqual(replied, { ...running, status: "replied", reply: "Done", replyTime: replied.replyTime });
+  assert.deepEqual(provider.listTasks(workspace), [replied]);
+  assert.deepEqual(notifications, [[original.id, "running"], [original.id, "replied"]]);
+  assert.deepEqual(await provider.dispatch(options).settled, replied);
+  const restored = new LocalTaskStore(persistence);
+  for (const token of ["original", "retry"]) {
+    assert.deepEqual(restored.findByToken(workspace, provider.id, token), replied);
+    assert.deepEqual(restored.create(workspace, { executor: provider.id, token }), replied);
+  }
+  assert.deepEqual(restored.list(workspace), [replied]);
+  assert.equal(requests.length, 1);
+});
+
 test("sends no authorization to local servers, decodes text parts, and uses the sibling models endpoint", async () => {
   const requests = [];
   const provider = createOpenAICompatibleProvider(config({ baseUrl: "http://localhost:12345/v1/chat/completions/", systemPrompt: "Default system" }), {

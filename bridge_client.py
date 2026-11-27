@@ -27,6 +27,7 @@ CODEX_EXIT_GRACE = 10.0
 REQUIRED_MODEL_PREFIX_ENV = "OBSIDIAN_CANVAS_BRIDGE_REQUIRED_MODEL_PREFIX"
 AGY_MODEL_ID = re.compile(r"[a-z0-9][a-z0-9._-]{1,95}")
 AGY_MODEL_TIER = re.compile(r"^([a-z0-9][a-z0-9._-]+)-(?:tiered-)?(?:low|medium|high|extra|max)$")
+JOB_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 def _parse_timeout(value):
@@ -50,16 +51,21 @@ def codex_max_timeout():
     return value if value is not None else float(CODEX_MAX_TIMEOUT)
 
 
+def request_matches_scope(item, request_id, route, workspace):
+    return (isinstance(item, dict) and item.get("request_id") == request_id
+            and item.get("target_project_id") == route["project_id"]
+            and item.get("target_conversation_id") == route["conversation_id"]
+            and isinstance(item.get("workspace_path"), str)
+            and Path(item["workspace_path"]).is_relative_to(workspace))
+
+
 def paired_requests(bridge, route, workspace):
     files = sorted((bridge.BUS_DIR / "requests").glob("req_*.json"), reverse=True)
     for file in files:
         if not bridge.REQUEST_ID.fullmatch(file.stem):
             continue
         item = bridge._read_json_safe(file)
-        if (item and item.get("request_id") == file.stem
-                and item.get("target_project_id") == route["project_id"]
-                and item.get("target_conversation_id") == route["conversation_id"]
-                and Path(item.get("workspace_path") or "").is_relative_to(workspace)):
+        if request_matches_scope(item, file.stem, route, workspace):
             yield item
 
 
@@ -319,10 +325,12 @@ def codex_task(job):
     return {
         "id": job["job_id"], "executor": "codex", "mode": job.get("mode", ""),
         "canvasPath": job.get("canvas_path", ""), "selectedIds": job.get("selected_ids", []),
+        "boardPath": job.get("board_path", ""), "cardPaths": job.get("card_paths", []),
         "targetWorkspace": job.get("target_workspace", ""), "status": job.get("status", "running"),
         "prompt": job.get("prompt", ""), "reply": job.get("reply", ""),
         "time": job.get("submitted_at", ""), "replyTime": job.get("replyTime", ""),
         "error": job.get("error", ""), "model": job.get("observed_model") or job.get("requested_model", ""),
+        "effort": job.get("requested_effort", ""), "stepGoal": job.get("step_goal", ""),
     }
 
 
@@ -347,6 +355,35 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+def resolve_codex_options(bridge, selected_model="", selected_effort="", fallback_model="", fallback_effort=""):
+    profile = worker_profile(bridge)
+    model = selected_model or fallback_model or profile["model"]
+    effort = selected_effort or fallback_effort or profile["effort"]
+    if not is_allowed_model(model):
+        return None, None, model_guard_error()
+    if selected_model and selected_model != profile["model"]:
+        catalog_ids = {item["id"] for item in codex_models_catalog(profile)[0]}
+        if selected_model not in catalog_ids:
+            return None, None, f"所选 Codex 模型不可用：{selected_model}"
+    return model, effort, None
+
+
+def start_codex_job(server, file, job):
+    write_job(file, job)
+    try:
+        subprocess.Popen(
+            [sys.executable, "-I", "-B", "-X", "utf8", str(Path(__file__).resolve()),
+             "--codex-worker", str(server), str(file)],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0),
+            close_fds=True,
+        )
+    except Exception as error:
+        message = f"无法启动 Codex 后台任务：{error}"
+        write_job(file, {**job, "status": "blocked", "error": message, "replyTime": now_iso()})
+        return {"ok": False, "error": message}
+    return {"ok": True, "job_id": job["job_id"]}
+
+
 def dispatch_codex(bridge, server, workspace, payload):
     token = str(payload.get("token", "")).strip()
     if not token:
@@ -356,17 +393,11 @@ def dispatch_codex(bridge, server, workspace, payload):
         for job in workspace_jobs(bridge, workspace):
             if job.get("token") == token:
                 return {"ok": True, "job_id": job["job_id"]}
-        profile = worker_profile(bridge)
         selected_model = str(payload.get("model") or "").strip()
         selected_effort = str(payload.get("effort") or "").strip()
-        model = selected_model or profile["model"]
-        effort = selected_effort or profile["effort"]
-        if not is_allowed_model(model):
-            return {"ok": False, "error": model_guard_error()}
-        if selected_model:
-            catalog_ids = {item["id"] for item in codex_models_catalog(profile)[0]}
-            if selected_model != profile["model"] and selected_model not in catalog_ids:
-                return {"ok": False, "error": f"所选 Codex 模型不可用：{selected_model}"}
+        model, effort, error = resolve_codex_options(bridge, selected_model, selected_effort)
+        if error:
+            return {"ok": False, "error": error}
         target = Path((payload.get("target_workspace") or "").strip() or workspace)
         if not target.is_absolute() or not target.is_dir():
             return {"ok": False, "error": "目标工作目录必须是已存在的本地绝对路径。"}
@@ -380,24 +411,53 @@ def dispatch_codex(bridge, server, workspace, payload):
             "mode": payload.get("mode", "execute_task"), "workspace": str(workspace),
             "target_workspace": str(target.resolve()), "canvas_path": payload.get("canvas_path", ""),
             "selected_ids": payload.get("selected_ids", []), "prompt": text,
+            "board_path": payload.get("board_path", ""), "card_paths": payload.get("card_paths", []),
             "step_goal": payload.get("step_goal") or "处理 Obsidian 指令",
             "requested_model": model, "requested_effort": effort,
             "model_selected": bool(selected_model or selected_effort),
             "submitted_at": now_iso(), "token": token,
         }
-        write_job(file, job)
-        try:
-            subprocess.Popen(
-                [sys.executable, "-I", "-B", "-X", "utf8", str(Path(__file__).resolve()),
-                 "--codex-worker", str(server), str(file)],
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0),
-                close_fds=True,
-            )
-        except Exception as error:
-            message = f"无法启动 Codex 后台任务：{error}"
-            write_job(file, {**job, "status": "blocked", "error": message, "replyTime": now_iso()})
-            return {"ok": False, "error": message}
-    return {"ok": True, "job_id": job_id}
+        return start_codex_job(server, file, job)
+
+
+def rerun_codex(bridge, server, workspace, payload):
+    token = str(payload.get("token", "")).strip()
+    if not token:
+        raise ValueError("Codex 指令缺少幂等 token。")
+    job_id = str(payload.get("job_id", "")).strip()
+    if not JOB_ID.fullmatch(job_id):
+        raise ValueError("无效的 Codex 任务编号。")
+    directory = bridge.BUS_DIR / CODEX_JOBS
+    file = directory / f"job_{job_id}.json"
+    with bridge._mutex(directory / "dispatch.mutex"):
+        job = bridge._read_json_safe(file)
+        if (not isinstance(job, dict) or job.get("job_id") != job_id
+                or not isinstance(job.get("workspace"), str)
+                or os.path.normcase(job["workspace"]) != os.path.normcase(workspace)):
+            return {"ok": False, "error": "找不到可重跑的 Codex 任务记录。"}
+        if job.get("rerun_token") == token:
+            return {"ok": True, "job_id": job_id}
+        if job.get("status") == "running":
+            return {"ok": False, "error": "该任务正在执行中，请勿重复重跑。"}
+        if job.get("status") not in ("blocked", "notification_failed"):
+            return {"ok": False, "error": "仅受阻任务支持重跑。"}
+        selected_model = str(payload.get("model") or "").strip()
+        selected_effort = str(payload.get("effort") or "").strip()
+        model, effort, error = resolve_codex_options(
+            bridge, selected_model, selected_effort, job.get("requested_model"), job.get("requested_effort"),
+        )
+        if error:
+            return {"ok": False, "error": error}
+        target = Path((job.get("target_workspace") or "").strip() or workspace)
+        if not target.is_absolute() or not target.is_dir():
+            return {"ok": False, "error": "目标工作目录必须是已存在的本地绝对路径。"}
+        updated = {
+            **job, "status": "running", "error": "", "reply": "", "replyTime": "", "dispatch_id": "",
+            "observed_model": "", "requested_model": model, "requested_effort": effort,
+            "model_selected": bool(job.get("model_selected") or selected_model or selected_effort),
+            "rerun_token": token, "rerun_at": now_iso(), "retry_count": int(job.get("retry_count") or 0) + 1,
+        }
+        return start_codex_job(server, file, updated)
 
 
 def _headless_runner(bridge):
@@ -546,7 +606,7 @@ def _bind_ephemeral_session(bridge, workspace_path, model, effort, speed):
 
 
 def acquire_codex_binding(bridge, job, model, effort, speed) -> tuple[str, bool]:
-    workspace_path = job["target_workspace"]
+    workspace_path = (job.get("target_workspace") or "").strip() or job["workspace"]
     binding = bridge.tool_bind_session(
         workspace_path=workspace_path, transport="codex_exec", mode="autopilot",
         codex_model=model, codex_effort=effort, codex_speed=speed,
@@ -579,9 +639,14 @@ def execute_codex_job(bridge, file, job):
     binding_id, ephemeral_binding = acquire_codex_binding(bridge, job, model, effort, profile["speed"])
     try:
         job.update(binding_id=binding_id, requested_model=model, requested_effort=effort)
+        constraints = ""
+        if job.get("board_path") or job.get("card_paths"):
+            constraints = "遵循指令中的 Kanban 回写契约，在回复末尾输出 kanban-patch 代码块，由用户在 Obsidian 中应用状态与进展更新。"
+        elif job.get("canvas_path"):
+            constraints = "遵循指令中的 Canvas 回写契约，由用户在 Obsidian 中应用补丁。"
         dispatch = bridge.tool_dispatch_task(
             binding_id=binding_id, step_goal=job["step_goal"], task_instruction=job["prompt"],
-            constraints="遵循指令中的 Canvas 回写契约，由用户在 Obsidian 中应用补丁。" if job["canvas_path"] else "",
+            constraints=constraints,
             wait_for_result=False, reply_format="natural", routing_tag="obsidian-canvas",
         )
         dispatch_id = dispatch.get("dispatch_id")
@@ -653,6 +718,33 @@ def submit_mcp(server, workspace, text, marker, required_model="", target_conver
     raise RuntimeError("发送结果待确认。刷新记录后可重试同一条指令。")
 
 
+def remove_replaced_request(bridge, route, workspace, replace_id):
+    try:
+        with bridge._mutex(bridge.BUS_DIR / "replies.mutex"):
+            old_req_path = bridge.BUS_DIR / "requests" / f"{replace_id}.json"
+            if not old_req_path.exists():
+                return
+            old_item = bridge._read_json_safe(old_req_path)
+            if not request_matches_scope(old_item, replace_id, route, workspace):
+                return
+            source = old_item.get("self_check")
+            if not isinstance(source, str) or not source.startswith(SOURCE_PREFIX):
+                return
+            try:
+                if not Path(old_item["workspace_path"]).resolve().is_relative_to(workspace):
+                    return
+            except (RuntimeError, ValueError):
+                return
+            if (old_item.get("status") == "replied" or old_item.get("replied_at")
+                    or (bridge.BUS_DIR / "replies" / f"{replace_id}.json").exists()
+                    or (bridge.codex_tool_fetch_director_reply(replace_id) or {}).get("replied_at")):
+                return
+            old_req_path.unlink(missing_ok=True)
+            (bridge.BUS_DIR / "deliveries" / f"{replace_id}.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def send(bridge, server, workspace, payload):
     text = payload["text"].strip()
     if not text:
@@ -680,8 +772,11 @@ def send(bridge, server, workspace, payload):
         if not result.get("ok"):
             raise RuntimeError(result.get("error_code") or result.get("message") or "桥接未接受指令。")
         request_id = result.get("request_id", "")
-        if not bridge.REQUEST_ID.fullmatch(request_id):
+        if not isinstance(request_id, str) or not bridge.REQUEST_ID.fullmatch(request_id):
             raise RuntimeError("桥接还未返回有效的请求编号。")
+        replace_id = str(payload.get("replace_request_id") or "").strip()
+        if replace_id and replace_id != request_id and bridge.REQUEST_ID.fullmatch(replace_id):
+            remove_replaced_request(bridge, route, workspace, replace_id)
         return {"ok": True, "request_id": request_id}
 
 
@@ -708,6 +803,8 @@ def main():
         return send(bridge, server, workspace, payload)
     if payload["action"] == "dispatch_codex":
         return dispatch_codex(bridge, server, workspace, payload)
+    if payload["action"] == "rerun_codex":
+        return rerun_codex(bridge, server, workspace, payload)
     raise ValueError("未知的侧栏操作。")
 
 

@@ -56,6 +56,10 @@
 .bridge-chat .bc-actions small { color: var(--text-muted); font-size: var(--font-ui-smaller); }
 .bridge-chat .bc-feedback:empty { display: none; }
 .bridge-chat .bc-feedback:not(:empty), .bridge-chat .bc-task-error { margin-bottom: 6px; font-size: var(--font-ui-small); }
+.bridge-chat .bc-task-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
+.bridge-chat .bc-rerun { display: inline-flex; align-items: center; gap: 5px; font-size: var(--font-ui-smaller); }
+.bridge-chat .bc-rerun svg { width: 14px; height: 14px; }
+.bridge-chat .bc-rerun:disabled { opacity: 0.55; }
 .bridge-chat .bc-send { white-space: nowrap; }
 .bridge-chat .bc-compose-options, .bridge-chat .bc-selection-header,
 .bridge-chat .bc-repo, .bridge-chat .bc-patch {
@@ -194,6 +198,55 @@
 .bridge-chat .bc-card-header .bc-badge { color: var(--bc-badge-color, var(--text-accent)); }
 .bridge-chat .bc-card-geometry { font-variant-numeric: tabular-nums; }
 .bridge-chat .bc-card-focus { margin-left: auto; padding: 1px 5px; height: auto; font-size: inherit; }
+
+.bases-kanban-card.bc-kanban-selected {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: -2px;
+}
+.bc-kanban-overlay {
+  position: absolute;
+  bottom: 6px;
+  right: 6px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  max-width: calc(100% - 12px);
+  pointer-events: none;
+}
+.bc-kanban-dispatch-btn {
+  pointer-events: auto;
+  white-space: nowrap;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+}
+.bc-kanban-status-chip {
+  border-radius: var(--radius-s);
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  overflow: hidden;
+  padding: 2px 5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bridge-chat :is(.bc-kanban-bar, .bc-kanban-status-actions) {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+}
+.bridge-chat .bc-kanban-bar[hidden], .bc-kanban-status-chip[hidden] { display: none; }
+.bridge-chat .bc-kanban-status-select { max-width: 100%; }
+.bridge-chat .bc-kanban-auto-label { display: inline-flex; align-items: center; gap: 4px; }
+.bridge-chat .bc-kanban-auto-status { margin: 0; }
+.bc-kanban-dispatch-btn, .bridge-chat :is(.bc-kanban-quick-send, .bc-kanban-quick-status) {
+  height: auto;
+  padding: 2px 7px;
+  font-size: var(--font-ui-smaller);
+}
 .bridge-chat .bc-card-body {
   max-height: 160px;
   overflow: auto;
